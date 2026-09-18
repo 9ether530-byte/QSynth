@@ -4091,13 +4091,25 @@ async function run2(ctx) {
     );
     const e = result.estimate;
     await tx.query(
-      `insert into resource_estimates (org_id, job_id, qubits, ancillas, depth, gate_count, two_qubit_count, t_count, t_depth)
-       values ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+      `insert into resource_estimates
+         (org_id, job_id, qubits, ancillas, depth, gate_count, two_qubit_count, t_count, t_depth, clifford_gate_count)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
       // Counted off the reversible circuit: qubits, ancillas, depth, gate_count. Counted
       // off the Clifford+T decomposition this compile emitted: two_qubit_count, t_count,
-      // t_depth. Both are measurements here — the estimate fast path, which projects them
-      // from a table, never reaches this insert.
-      [orgId, jobId, e.qubits, e.ancillaQubits, e.depth, e.gateCount, e.cliffordT.twoQubitGates, e.cliffordT.tCount, e.cliffordT.tDepth]
+      // t_depth, clifford_gate_count. Both are measurements here — the estimate fast path,
+      // which projects them from a table, never reaches this insert.
+      [
+        orgId,
+        jobId,
+        e.qubits,
+        e.ancillaQubits,
+        e.depth,
+        e.gateCount,
+        e.cliffordT.twoQubitGates,
+        e.cliffordT.tCount,
+        e.cliffordT.tDepth,
+        e.cliffordT.gateCount
+      ]
     );
     const artifacts = await recordArtifacts(tx, orgId, jobId, stored);
     const version = await nextVersion(tx, orgId, specId, projectId, jobId);
@@ -4178,7 +4190,7 @@ async function get2(ctx) {
       [id]
     );
     const resources = await tx.one(
-      `select qubits, ancillas, depth, gate_count, two_qubit_count, t_count, t_depth
+      `select qubits, ancillas, depth, gate_count, two_qubit_count, t_count, t_depth, clifford_gate_count
          from resource_estimates where job_id = $1`,
       [id]
     );
@@ -4208,6 +4220,14 @@ async function get2(ctx) {
       checksReached: data.report.checks.filter((c) => c.status !== "skipped").map((c) => c.id),
       stoppedAt: data.report.checks.find((c) => c.status === "failed")?.id ?? null
     } : null,
+    // The same two-object split the compile response uses, rebuilt from the stored row.
+    //
+    // `source` is derived rather than stored, and `clifford_gate_count` is what derives
+    // it: a row can only carry the size of a decomposition if a decomposition was built,
+    // and every job compiled since that stage exists builds one. A row from before it
+    // has T figures that were read off the per-gate table, and calling those `measured`
+    // because they now sit in the same column as measured ones would be the exact
+    // misreading the split exists to prevent.
     resources: data.resources ? {
       measured: {
         qubits: data.resources["qubits"],
@@ -4215,10 +4235,12 @@ async function get2(ctx) {
         depth: data.resources["depth"],
         gateCount: data.resources["gate_count"]
       },
-      projected: {
+      cliffordT: {
+        source: data.resources["clifford_gate_count"] == null ? "projected" : "measured",
         twoQubitGates: data.resources["two_qubit_count"],
         tCount: data.resources["t_count"],
-        tDepth: data.resources["t_depth"]
+        tDepth: data.resources["t_depth"],
+        gateCount: data.resources["clifford_gate_count"] ?? null
       }
     } : null,
     artifacts: data.artifacts.map((a) => ({ id: a.id, kind: a.kind, contentHash: a.content_hash, sizeBytes: a.size_bytes })),
