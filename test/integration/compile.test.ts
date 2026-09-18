@@ -321,20 +321,22 @@ describe('the Python subset', () => {
     expect(after.body.jobs).toHaveLength(before.body.jobs.length);
   });
 
-  it('reaches the same circuit as the equivalent truth table', async () => {
-    // Same function, two notations. If the frontends were doing anything beyond notation,
-    // the resource figures would part company here.
+  it('reaches the same circuit as the equivalent Boolean expression', async () => {
+    // `a & b` in Python and `out = a AND b` in the expression language are two spellings of
+    // one operation, so they must cost the same. (A truth table would not: that frontend
+    // enumerates minterms, which is a different circuit for the same function — a real
+    // difference in the specification, not in the compiler.)
     const python = await call('POST', '/v1/compile/estimate', {
       auth: { token: org.token },
       body: { kind: 'python', source: 'def f(a: bit, b: bit) -> bit:\n    return a & b\n' },
     });
-    const table = await call('POST', '/v1/compile/estimate', {
+    const expression = await call('POST', '/v1/compile/estimate', {
       auth: { token: org.token },
-      body: { kind: 'truthtable', source: 'a b | out\n0 0 | 0\n0 1 | 0\n1 0 | 0\n1 1 | 1\n' },
+      body: { kind: 'boolean', source: 'in a, b\nout = a AND b\n' },
     });
     expect(python.status, JSON.stringify(python.body)).toBe(200);
-    expect(table.status).toBe(200);
-    expect(python.body.resources.measured.qubits).toBe(table.body.resources.measured.qubits);
-    expect(python.body.resources.measured.gateCount).toBe(table.body.resources.measured.gateCount);
+    expect(expression.status).toBe(200);
+    expect(python.body.resources.measured.qubits).toBe(expression.body.resources.measured.qubits);
+    expect(python.body.resources.measured.gateCount).toBe(expression.body.resources.measured.gateCount);
   });
 });
