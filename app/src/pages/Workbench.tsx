@@ -221,7 +221,12 @@ export default function WorkbenchPage() {
               hint={STARTERS[kind]}
             />
           </div>
-          <p className="border-t border-rule px-3 py-2 text-xs text-ink-dim">{KIND_HINTS[kind]}</p>
+          <p className="border-t border-rule px-3 py-2 text-xs text-ink-dim">
+            {KIND_HINTS[kind]}{' '}
+            <span className="text-ink-faint">
+              In the editor, Tab indents; press Escape then Tab to move on to the next control.
+            </span>
+          </p>
           {compile.error ? (
             <div className="border-t border-rule p-3">
               <ErrorNotice error={compile.error} />

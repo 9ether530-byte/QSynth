@@ -21,7 +21,7 @@
 import { useEffect, useRef } from 'react';
 import { EditorState, StateEffect, StateField, type Extension } from '@codemirror/state';
 import { Decoration, EditorView, keymap, lineNumbers, highlightActiveLine, placeholder, type DecorationSet } from '@codemirror/view';
-import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
+import { defaultKeymap, history, historyKeymap, indentMore, indentLess } from '@codemirror/commands';
 import { lintGutter, setDiagnostics, type Diagnostic } from '@codemirror/lint';
 import type { Span } from '../lib/types';
 
@@ -57,6 +57,50 @@ function offsetOf(state: EditorState, span: Span): { from: number; to: number } 
   return { from, to: to > from ? to : Math.min(from + 1, state.doc.length) };
 }
 
+/**
+ * Tab without the keyboard trap.
+ *
+ * A code editor wants Tab to indent; a keyboard user needs Tab to leave. Binding Tab to
+ * `indentWithTab` gives the first and destroys the second — a keyboard-only user who
+ * reaches the editor cannot get out of it, which is a WCAG 2.1.2 failure, and the first
+ * keyboard pass over the deployed workbench found exactly that: fourteen Tab presses
+ * produced fourteen spaces and never moved focus.
+ *
+ * So Tab indents *until* Escape is pressed, after which the next Tab moves focus. Any
+ * other key puts it back to indenting. This is the escape hatch Monaco and the CodeMirror
+ * docs both use, and the panel below the editor states it in words, which is what 2.1.2
+ * asks for when focus movement is not the plain Tab behaviour.
+ *
+ * The flag is a closure variable rather than editor state on purpose: it is a property of
+ * the user's last keystroke, not of the document, and it must not survive into history or
+ * undo.
+ */
+function tabKeymap(): Extension {
+  let escaped = false;
+  return [
+    keymap.of([
+      // `run` returning false lets the event keep travelling — Escape still reaches
+      // anything else that wants it, such as a lint tooltip.
+      { key: 'Escape', run: () => ((escaped = true), false) },
+      {
+        key: 'Tab',
+        run: (view) => (escaped ? false : indentMore(view)),
+        shift: (view) => (escaped ? false : indentLess(view)),
+      },
+    ]),
+    EditorView.domEventHandlers({
+      keydown: (event) => {
+        if (event.key !== 'Tab' && event.key !== 'Escape' && !event.shiftKey) escaped = false;
+        return false;
+      },
+      focus: () => {
+        escaped = false;
+        return false;
+      },
+    }),
+  ];
+}
+
 function extensions(onChange: (value: string) => void, readOnly: boolean, hint: string): Extension[] {
   return [
     lineNumbers(),
@@ -65,7 +109,9 @@ function extensions(onChange: (value: string) => void, readOnly: boolean, hint: 
     highlightActiveLine(),
     highlightField,
     placeholder(hint),
-    keymap.of([...defaultKeymap, ...historyKeymap, indentWithTab]),
+    // Ahead of the default keymap so the Tab and Escape bindings win.
+    tabKeymap(),
+    keymap.of([...defaultKeymap, ...historyKeymap]),
     EditorView.lineWrapping,
     EditorState.readOnly.of(readOnly),
     EditorView.updateListener.of((update) => {
