@@ -26,14 +26,25 @@ function number(value: number | null | undefined): string {
   return value === null || value === undefined ? '—' : value.toLocaleString('en-US');
 }
 
+/**
+ * Two different things wear the word "skipped", and conflating them is the one mistake
+ * this panel exists to prevent.
+ *
+ * A check with a stored result and `status: 'skipped'` **ran**: it looked for invariants
+ * or budgets, found none declared, and had nothing to decide. That is vacuous, not
+ * unknown. A check with no result at all never ran, because an earlier one failed and
+ * stopped the pipeline — its verdict is genuinely unknown, and calling it anything softer
+ * would let a failure on check 2 read as five checks that passed.
+ */
 function CheckRow({ id, title, result }: { id: string; title: string; result: CheckResult | undefined }) {
   const status = result?.status ?? 'skipped';
   const tone = toneForCheck(status);
+  const label = status !== 'skipped' ? status : result ? 'nothing to check' : 'not reached';
   return (
     <li className="border-b border-rule/60 px-3 py-2 last:border-b-0">
       <div className="flex items-baseline justify-between gap-3">
         <span className="text-sm">{result?.title ?? title}</span>
-        <StatusText tone={tone} label={status === 'skipped' ? 'not reached' : status} />
+        <StatusText tone={tone} label={label} />
       </div>
       {result ? (
         <p className="mt-1 text-xs text-ink-dim">{result.summary}</p>
