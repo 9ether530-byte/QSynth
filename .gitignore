@@ -1,0 +1,4 @@
+node_modules/
+.*
+!.gitignore
+openkbs.local.json
