@@ -11,24 +11,47 @@ import { render, type RenderResult } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { MemoryRouter } from 'react-router-dom';
 import App from '../src/App';
-import { useSession } from '../src/lib/session';
+import { useSession, type SessionOrg } from '../src/lib/session';
 import * as fixtures from './fixtures';
 
 export { apiStub } from './stub';
 
 /** Put the store in the state a signed-in reload would reach. */
-export function signIn(): void {
+export function signIn(organizations: readonly SessionOrg[] = [{ id: 'o1', name: 'Acme Quantum', role: 'owner' }]): void {
   useSession.setState({
     token: 'test-token',
     user: { id: 'u1', email: 'eng@example.com', name: 'Engineer' },
-    organization: { id: 'o1', name: 'Acme Quantum', role: 'owner' },
+    organization: organizations[0] ?? null,
+    activeOrgId: organizations[0]?.id ?? null,
+    organizations,
     permissions: fixtures.principal.permissions ?? [],
     loading: false,
   });
 }
 
+/** Signed in, but with no organization chosen yet — a reload before the first `me`. */
+export function signInWithoutOrg(): void {
+  useSession.setState({
+    token: 'test-token',
+    user: { id: 'u1', email: 'eng@example.com', name: 'Engineer' },
+    organization: null,
+    activeOrgId: null,
+    organizations: [],
+    permissions: [],
+    loading: true,
+  });
+}
+
 export function signOut(): void {
-  useSession.setState({ token: null, user: null, organization: null, permissions: [], loading: false });
+  useSession.setState({
+    token: null,
+    user: null,
+    organization: null,
+    activeOrgId: null,
+    organizations: [],
+    permissions: [],
+    loading: false,
+  });
 }
 
 export function renderAt(route: string, element?: ReactElement): RenderResult {

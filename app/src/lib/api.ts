@@ -69,6 +69,20 @@ export function setAuthToken(token: string | null): void {
   authToken = token;
 }
 
+/**
+ * Which organization the session is acting in.
+ *
+ * The API refuses to guess for a user who belongs to more than one — it answers
+ * `NO_ORG_CONTEXT` rather than picking, because "their first org" is a cross-tenant
+ * hazard the moment the order changes. Anyone added to a second organization is in that
+ * position, so the header is not an edge case; without it the app is unusable for them.
+ */
+let activeOrgId: string | null = null;
+
+export function setActiveOrg(orgId: string | null): void {
+  activeOrgId = orgId;
+}
+
 interface RequestOptions {
   readonly method?: 'GET' | 'POST' | 'PATCH' | 'DELETE';
   readonly body?: unknown;
@@ -80,6 +94,7 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
   const headers: Record<string, string> = { accept: 'application/json' };
   if (options.body !== undefined) headers['content-type'] = 'application/json';
   if (authToken) headers['authorization'] = `Bearer ${authToken}`;
+  if (activeOrgId) headers['x-org-id'] = activeOrgId;
   if (options.idempotencyKey) headers['idempotency-key'] = options.idempotencyKey;
 
   let response: Response;

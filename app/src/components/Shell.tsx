@@ -8,6 +8,7 @@
  */
 import { NavLink, Outlet, useNavigate } from 'react-router-dom';
 import { api } from '../lib/api';
+import { useChooseOrg } from '../lib/org';
 import { useSession } from '../lib/session';
 
 function Tab({ to, children, end = false }: { to: string; children: React.ReactNode; end?: boolean }) {
@@ -29,9 +30,53 @@ function Tab({ to, children, end = false }: { to: string; children: React.ReactN
   );
 }
 
+/**
+ * The organization switcher, shown only to people who have somewhere to switch to.
+ *
+ * A native `<select>` with a real label: the choice is one-of-N from a short list, which
+ * is exactly what the element is for, and it costs nothing in keyboard or screen-reader
+ * support. Changing it clears the query cache (see `useChooseOrg`) and returns to the
+ * project list, because a project id from the previous organization means nothing here.
+ */
+function OrgSwitcher({ onSwitch }: { onSwitch: () => void }) {
+  const organization = useSession((s) => s.organization);
+  const organizations = useSession((s) => s.organizations);
+  const chooseOrg = useChooseOrg();
+
+  if (organizations.length < 2) {
+    return organization ? (
+      <span>
+        {organization.name} · <span className="font-mono">{organization.role}</span>
+      </span>
+    ) : null;
+  }
+
+  return (
+    <span className="flex items-baseline gap-2">
+      <label className="qs-label" htmlFor="org-switch">
+        Organization
+      </label>
+      <select
+        id="org-switch"
+        className="qs-input py-1 text-xs"
+        value={organization?.id ?? ''}
+        onChange={(event) => {
+          chooseOrg(event.target.value);
+          onSwitch();
+        }}
+      >
+        {organizations.map((org) => (
+          <option key={org.id} value={org.id}>
+            {org.name} · {org.role}
+          </option>
+        ))}
+      </select>
+    </span>
+  );
+}
+
 export function Shell() {
   const user = useSession((s) => s.user);
-  const organization = useSession((s) => s.organization);
   const signOut = useSession((s) => s.signOut);
   const navigate = useNavigate();
 
@@ -66,12 +111,8 @@ export function Shell() {
           <Tab to="/settings/keys">API keys</Tab>
           <Tab to="/settings/audit">Audit</Tab>
         </nav>
-        <div className="ml-auto flex items-center gap-4 text-xs text-ink-dim">
-          {organization ? (
-            <span>
-              {organization.name} · <span className="font-mono">{organization.role}</span>
-            </span>
-          ) : null}
+        <div className="ml-auto flex items-center gap-4 py-2 text-xs text-ink-dim">
+          <OrgSwitcher onSwitch={() => navigate('/', { replace: true })} />
           {user ? <span className="font-mono">{user.email}</span> : null}
           <button type="button" className="qs-btn" onClick={leave}>
             Sign out

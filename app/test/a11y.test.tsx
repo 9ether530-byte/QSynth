@@ -21,7 +21,8 @@ vi.mock('../src/lib/api', async (importOriginal) => {
   return { ...actual, api: apiStub };
 });
 
-const { renderAt, signIn, signOut } = await import('./harness');
+const { apiStub, renderAt, signIn, signInWithoutOrg, signOut } = await import('./harness');
+const { ApiError } = await import('../src/lib/api');
 
 async function violations(): Promise<axe.Result[]> {
   const results = await axe.run(document.body, {
@@ -80,6 +81,25 @@ describe('accessibility', () => {
   it('has no violations on the audit log', async () => {
     renderAt('/settings/audit');
     await screen.findByText('compile.succeeded');
+    const found = await violations();
+    expect(describeViolations(found)).toBe('');
+  });
+
+  it('has no violations on the organization chooser', async () => {
+    // The first screen an invited user ever sees, and the one route that is reached only
+    // by an API refusal — easy to leave out of a sweep like this precisely because no
+    // navigation leads to it.
+    signInWithoutOrg();
+    apiStub.me.mockRejectedValueOnce(
+      new ApiError(400, 'NO_ORG_CONTEXT', 'Ambiguous.', 'Name one.', {
+        organizations: [
+          { id: 'o1', name: 'Acme Quantum', role: 'owner' },
+          { id: 'o2', name: 'Hopper Review', role: 'viewer' },
+        ],
+      }),
+    );
+    renderAt('/');
+    await screen.findByRole('heading', { name: 'Choose an organization' });
     const found = await violations();
     expect(describeViolations(found)).toBe('');
   });

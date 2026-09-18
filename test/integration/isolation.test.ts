@@ -122,6 +122,18 @@ describe('org context selection', () => {
     expect(res.status).toBe(400);
     expect(errorCode(res)).toBe('NO_ORG_CONTEXT');
 
+    // The refusal has to be answerable. The workbench renders a chooser straight from
+    // this payload, so it must carry names and roles — a list of bare uuids would be a
+    // question no human can answer, and the interface would have nothing to show.
+    const offered = res.body.error.details.organizations as { id: string; name: string; role: string }[];
+    expect(offered.map((o) => o.id)).toContain(alpha.orgId);
+    expect(offered.length).toBe(2);
+    for (const org of offered) {
+      expect(typeof org.name).toBe('string');
+      expect(org.name.length).toBeGreaterThan(0);
+      expect(['owner', 'admin', 'developer', 'viewer']).toContain(org.role);
+    }
+
     const scoped = await call('GET', '/v1/projects', { auth: { token: dual.token, orgId: alpha.orgId } });
     expect(scoped.status).toBe(200);
   });

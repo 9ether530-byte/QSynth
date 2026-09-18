@@ -99,11 +99,24 @@ export async function authenticate(
     }
     membership = match;
   } else if (memberships.length > 1) {
+    // The refusal carries names, not just ids: whatever is on the other end has to ask
+    // someone which organization they meant, and a list of uuids is not a question a
+    // person can answer. Fetched only in this branch — the common case is a single
+    // membership and should not pay for a join it will never read.
+    const named = await withTx({ orgId: null, userId: session.user_id }, (tx) =>
+      tx.query<{ id: string; name: string; slug: string; role: Role }>(
+        `select o.id, o.name, o.slug, m.role
+           from memberships m join organizations o on o.id = m.org_id
+          where m.user_id = $1
+          order by m.created_at`,
+        [session.user_id],
+      ),
+    );
     throw new ApiError(
       'NO_ORG_CONTEXT',
       'Your account belongs to several organizations, so the target is ambiguous.',
       'Send an X-Org-Id header naming the organization to act in.',
-      { organizations: memberships.map((m) => m.org_id) },
+      { organizations: named },
     );
   }
 

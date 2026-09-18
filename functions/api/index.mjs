@@ -215,11 +215,21 @@ async function authenticate(headers) {
     }
     membership = match;
   } else if (memberships.length > 1) {
+    const named2 = await withTx(
+      { orgId: null, userId: session.user_id },
+      (tx) => tx.query(
+        `select o.id, o.name, o.slug, m.role
+           from memberships m join organizations o on o.id = m.org_id
+          where m.user_id = $1
+          order by m.created_at`,
+        [session.user_id]
+      )
+    );
     throw new ApiError(
       "NO_ORG_CONTEXT",
       "Your account belongs to several organizations, so the target is ambiguous.",
       "Send an X-Org-Id header naming the organization to act in.",
-      { organizations: memberships.map((m) => m.org_id) }
+      { organizations: named2 }
     );
   }
   return {
