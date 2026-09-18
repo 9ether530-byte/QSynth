@@ -77,7 +77,10 @@ export function verify(
       phase: 'verify',
       kind: `check.${result.status}`,
       message: `${result.title}: ${result.summary}`,
-      detail: { check: id, status: result.status, durationMs: result.durationMs },
+      // No timing here on purpose: the trace is stored as a content-addressed artifact,
+      // and a wall-clock number would give the same compilation a different hash on every
+      // run. Per-check durations live in the verification report, which is not hashed.
+      detail: { check: id, status: result.status },
     });
     if (result.status === 'failed') stopped = id;
   }

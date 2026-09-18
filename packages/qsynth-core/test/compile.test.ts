@@ -205,12 +205,6 @@ describe('estimate-only path', () => {
   });
 });
 
-function without(detail: unknown, key: string): unknown {
-  if (detail === undefined || detail === null || typeof detail !== 'object') return detail;
-  const { [key]: _dropped, ...rest } = detail as Record<string, unknown>;
-  return rest;
-}
-
 /**
  * A spec that fits every structural limit but not the time budget: 18 inputs (so
  * verification samples 2^12 assignments) across a few thousand operations.
@@ -230,10 +224,19 @@ describe('reproducibility', () => {
     expect(second.qasm).toBe(first.qasm);
   });
 
-  it('produces identical traces and reports, apart from timing', () => {
+  /**
+   * The trace is compared *serialized*, not deeply: it is stored as a content-addressed
+   * artifact, so byte equality — not structural equality — is what keeps two runs of one
+   * spec pointing at one artifact row. A stray timestamp anywhere in it breaks that.
+   */
+  it('serializes the trace identically, so it is content-addressable', () => {
+    expect(JSON.stringify(compileOk(SPEC).trace)).toBe(JSON.stringify(compileOk(SPEC).trace));
+  });
+
+  it('produces identical reports, apart from timing', () => {
     const strip = (result: CompileResult) => ({
-      // Timings are the only thing allowed to vary between two runs of the same spec.
-      trace: result.trace.map((entry) => ({ ...entry, detail: without(entry.detail, 'durationMs') })),
+      // Durations are the only thing allowed to vary between two runs of the same spec,
+      // and they live only in the report, which is stored as rows rather than bytes.
       checks: result.report.checks.map(({ durationMs, ...rest }) => rest),
       passed: result.report.passed,
     });
