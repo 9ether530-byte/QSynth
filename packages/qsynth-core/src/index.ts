@@ -48,6 +48,15 @@ export * from './verify/decomposition.js';
 export * from './estimate/resources.js';
 export * from './emit/qasm3.js';
 export * from './verify/report.js';
+export * from './verify/plan.js';
 export * from './verify/checks.js';
+
+export * from './passes/types.js';
+export * from './passes/rewrite.js';
+export * from './passes/cancelInverses.js';
+export * from './passes/constantFold.js';
+export * from './passes/reuseValues.js';
+export * from './passes/dropUnusedAncillas.js';
+export * from './passes/runner.js';
 export * from './util/rng.js';
 export * from './compile.js';

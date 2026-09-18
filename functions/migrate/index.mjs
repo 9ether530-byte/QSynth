@@ -29,6 +29,34 @@ var MIGRATIONS = [
   {
     "name": "006_clifford_gate_count.sql",
     "sql": '-- ---------------------------------------------------------------------------\n-- 006: record the size of the Clifford+T decomposition, not only its T figures.\n--\n-- resource_estimates was written when the Clifford+T numbers were read off a\n-- per-gate table, and it kept the three a budget can be declared against:\n-- two-qubit count, T count, T depth. The compiler now builds the decomposition\n-- before estimating, so those three are measurements \u2014 and the total gate count\n-- of the decomposed circuit is a measurement too, and the one a reader needs to\n-- tell "this artifact is 36 gates" from "this artifact is 36 T gates".\n--\n-- Nullable rather than defaulted: rows written before this migration were never\n-- given a figure, and inventing a zero for them would say the decomposition was\n-- empty. NULL says what is true \u2014 this job predates the column.\n-- ---------------------------------------------------------------------------\n\nalter table resource_estimates add column clifford_gate_count integer;\n'
+  },
+  {
+    "name": "007_optimization_summary.sql",
+    "sql": `-- ---------------------------------------------------------------------------
+-- 007: record what the optimizer did, and what it refused to do.
+--
+-- The compiler now runs a pass pipeline between lowering and decomposition, and
+-- every pass is re-checked against the unoptimized circuit before it is kept. A
+-- pass that changed the circuit's behaviour is discarded, the unoptimized
+-- circuit is carried forward, and the compile still succeeds.
+--
+-- That last sentence is why this column exists. A discarded pass is a defect in
+-- the optimizer that the guard contained \u2014 the artifact is correct, so nothing
+-- fails, and without somewhere to write it down the event would leave no trace
+-- at all. Storing the summary next to the report makes "the guard caught one"
+-- an answerable question months later, per job, rather than a line in a log
+-- that has since rotated away.
+--
+-- It also records the before/after shape per pass, which is what lets a user ask
+-- why their circuit is the size it is and get an answer naming the passes.
+--
+-- Nullable: rows written before the optimizer existed have no summary, and an
+-- empty object would claim the pipeline ran and found nothing. NULL says what is
+-- true \u2014 this job predates the column.
+-- ---------------------------------------------------------------------------
+
+alter table verification_reports add column optimization jsonb;
+`
   }
 ];
 

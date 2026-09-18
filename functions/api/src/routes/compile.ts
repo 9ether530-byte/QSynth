@@ -29,17 +29,16 @@ import {
   TraceRecorder,
   compile,
   contentHash,
-  estimate as estimateResources,
   estimateOnly,
-  lowerToReversible,
-  lowerToQuantum,
   parseSpec,
   preflight,
+  rebuild,
   seedFromHash,
   verify,
   QsynthError,
   type CheckResult,
   type CompileResult,
+  type OptimizationSummary,
   type ResourceBudget,
   type ResourceEstimate,
   type SpecKind,
@@ -216,6 +215,12 @@ const reportView = (report: VerificationReport) => ({
   durationMs: report.durationMs,
   compilerVersion: report.compilerVersion,
   specHash: report.specHash,
+  // Reported next to the verdict rather than next to the resource figures, because the
+  // one thing a caller must be able to see is `discarded` — a non-zero count means a pass
+  // rewrote the circuit wrongly and the guard threw the rewrite away. The compile still
+  // succeeded and the artifact is still correct, so nothing else in this response would
+  // hint that it happened.
+  optimization: report.optimization ?? null,
 });
 
 /** The coverage mode the equivalence check actually used, for the stored report row. */
@@ -489,9 +494,10 @@ async function run(ctx: Ctx) {
     await recordEvent(tx, orgId, jobId, null, status, { durationMs: Math.round(result.durationMs), artifactHash: result.artifactHash });
 
     await tx.query(
-      `insert into verification_reports (org_id, job_id, passed, method, sample_count, seed, checks)
-       values ($1,$2,$3,$4,$5,$6,$7)`,
-      [orgId, jobId, result.report.passed, method, usedSamples, seedFromHash(specHash), JSON.stringify(result.report.checks)],
+      `insert into verification_reports (org_id, job_id, passed, method, sample_count, seed, checks, optimization)
+       values ($1,$2,$3,$4,$5,$6,$7,$8)`,
+      [orgId, jobId, result.report.passed, method, usedSamples, seedFromHash(specHash), JSON.stringify(result.report.checks),
+        result.optimization ? JSON.stringify(result.optimization) : null],
     );
 
     const e = result.estimate;
@@ -567,6 +573,9 @@ async function estimate(ctx: Ctx) {
     preflight: result.preflight,
     resources: resourceView(result.estimate),
     stages: result.stages,
+    // Null when the spec was refused at pre-flight: the figures are then the unoptimized
+    // ones, and saying so is the difference between an estimate and a guess.
+    optimization: result.optimization,
     durationMs: result.durationMs,
     verified: false,
   });
@@ -603,10 +612,14 @@ async function get(ctx: Ctx) {
       'select stage, status, duration_ms, error_code from compile_stages where job_id = $1 order by ordinal',
       [id],
     );
-    const report = await tx.one<{ passed: boolean; method: string; sample_count: number | null; seed: string; checks: CheckResult[] }>(
-      'select passed, method, sample_count, seed, checks from verification_reports where job_id = $1',
-      [id],
-    );
+    const report = await tx.one<{
+      passed: boolean;
+      method: string;
+      sample_count: number | null;
+      seed: string;
+      checks: CheckResult[];
+      optimization: OptimizationSummary | null;
+    }>('select passed, method, sample_count, seed, checks, optimization from verification_reports where job_id = $1', [id]);
     const resources = await tx.one<Record<string, number | null>>(
       `select qubits, ancillas, depth, gate_count, two_qubit_count, t_count, t_depth, clifford_gate_count
          from resource_estimates where job_id = $1`,
@@ -641,6 +654,10 @@ async function get(ctx: Ctx) {
           checks: data.report.checks,
           checksReached: data.report.checks.filter((c) => c.status !== 'skipped').map((c) => c.id),
           stoppedAt: data.report.checks.find((c) => c.status === 'failed')?.id ?? null,
+          // NULL here means the job predates the optimizer, not that it ran and did
+          // nothing — a pipeline that found nothing still writes a summary with four
+          // `no_change` outcomes.
+          optimization: data.report.optimization,
         }
       : null,
     // The same two-object split the compile response uses, rebuilt from the stored row.
@@ -713,21 +730,26 @@ async function reverify(ctx: Ctx) {
   const budget = parseBudget(loaded.spec.budgets);
   const report = withCompilerErrors(() => {
     const trace = new TraceRecorder();
-    const module = parseSpec({ kind, source: loaded.spec.source, name: loaded.spec.name }, trace);
-    const { circuit } = lowerToReversible(module, trace);
-    // Re-verification has to rebuild every stage the original compile ran, decomposition
-    // included. Stopping at the reversible layer would re-check a different circuit than
-    // the one that was signed off, and every job would then report a divergence in check
-    // 2 that says nothing about the job.
-    const quantum = lowerToQuantum(circuit, trace);
-    return verify(module, circuit, estimateResources(circuit, quantum), {
+    // Re-verification has to rebuild every stage the original compile ran — optimization
+    // and decomposition included. Stopping at the reversible layer would re-check a
+    // different circuit than the one that was signed off, and every job would then report
+    // a divergence in check 2 that says nothing about the job. `rebuild` is the same
+    // function `compile` runs, called for exactly that reason: a hand-written copy of the
+    // pipeline here would drift the next time a stage is added, and the symptom would be
+    // every re-verification failing rather than a build error.
+    const built = rebuild(
+      { kind, source: loaded.spec.source, name: loaded.spec.name, budget, sampleCount: loaded.stored!.sample_count ?? undefined },
+      trace,
+    );
+    return verify(built.module, built.circuit, built.estimate, {
       budget,
       compilerVersion: COMPILER_VERSION,
       specHash: loaded.job.spec_hash,
       sampleCount: loaded.stored!.sample_count ?? undefined,
       seed: Number(loaded.job.seed),
-      quantum,
+      quantum: built.quantum,
       trace,
+      optimization: built.optimization ?? undefined,
     });
   });
 

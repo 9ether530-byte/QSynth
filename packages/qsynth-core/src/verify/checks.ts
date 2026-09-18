@@ -12,7 +12,7 @@
  * only at the Clifford+T layer, and check 3's contract mentions it for that reason.
  */
 import type { ClassicalModule } from '../ir/classical.js';
-import { ARITY, EXHAUSTIVE_INPUT_LIMIT } from '../ir/classical.js';
+import { ARITY } from '../ir/classical.js';
 import type { ReversibleCircuit } from '../ir/reversible.js';
 import { GATE_ARITY, invert, targetsOf } from '../ir/reversible.js';
 import { assignmentToBits, evaluate, type Bit } from '../eval/classical.js';
@@ -22,7 +22,9 @@ import { BUDGET_FIELDS } from '../estimate/resources.js';
 import { Rng } from '../util/rng.js';
 import type { QuantumCircuit } from '../ir/quantum.js';
 import { checkDecomposition } from './decomposition.js';
+import { planAssignments } from './plan.js';
 import type { TraceRecorder } from '../trace/trace.js';
+import type { OptimizationSummary } from '../passes/types.js';
 import {
   buildReport,
   CHECK_ORDER,
@@ -31,7 +33,6 @@ import {
   type CheckId,
   type CheckResult,
   type Counterexample,
-  type Coverage,
   type VerificationReport,
 } from './report.js';
 
@@ -51,6 +52,13 @@ export interface VerifyOptions {
   readonly seed?: number;
   readonly exhaustiveLimit?: number;
   readonly trace?: TraceRecorder;
+  /**
+   * What the optimizer did, when it ran. It is carried into the report rather than
+   * reported separately because the report is the document the export gate consults, and
+   * a discarded pass is exactly the kind of thing whoever reads that document later needs
+   * to have been told without having to go looking.
+   */
+  readonly optimization?: OptimizationSummary;
 }
 
 /** Basis states used by check 3; reversibility is structural, so it needs points, not coverage. */
@@ -98,6 +106,7 @@ export function verify(
     compilerVersion: options.compilerVersion,
     specHash: options.specHash,
     durationMs: now() - started,
+    optimization: options.optimization,
   });
 }
 
@@ -161,47 +170,6 @@ function checkTypeShape(module: ClassicalModule, circuit: ReversibleCircuit): Ch
 }
 
 // --- 2. simulation equivalence ----------------------------------------------------
-
-interface Plan {
-  readonly assignments: number[];
-  readonly coverage: Coverage;
-}
-
-function planAssignments(module: ClassicalModule, options: VerifyOptions): Plan {
-  const n = module.inputs.length;
-  const space = 2 ** n;
-  const dontCare = new Set(module.dontCare);
-  const limit = options.exhaustiveLimit ?? EXHAUSTIVE_INPUT_LIMIT;
-
-  if (n <= limit) {
-    const assignments: number[] = [];
-    for (let a = 0; a < space; a++) if (!dontCare.has(a)) assignments.push(a);
-    return {
-      assignments,
-      coverage: { mode: 'exhaustive', checked: assignments.length, space, dontCare: dontCare.size },
-    };
-  }
-
-  // Above the limit the space cannot be enumerated inside a request. Sample it, and
-  // record the seed and the count so the claim is reproducible rather than a promise.
-  const seed = options.seed ?? 1;
-  const rng = new Rng(seed);
-  const wanted = options.sampleCount ?? 4096;
-  const seen = new Set<number>();
-  const assignments: number[] = [];
-  // Bounded attempts: with a near-total don't-care set, rejection sampling would spin.
-  for (let attempts = 0; attempts < wanted * 4 && assignments.length < wanted; attempts++) {
-    let a = 0;
-    for (let bit = 0; bit < n; bit++) if (rng.bit() === 1) a += 2 ** bit;
-    if (dontCare.has(a) || seen.has(a)) continue;
-    seen.add(a);
-    assignments.push(a);
-  }
-  return {
-    assignments,
-    coverage: { mode: 'sampled', checked: assignments.length, space, dontCare: dontCare.size, seed },
-  };
-}
 
 function namedInputs(module: ClassicalModule, bits: readonly Bit[]): Record<string, Bit> {
   const record: Record<string, Bit> = {};

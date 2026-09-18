@@ -19,10 +19,7 @@ import { describe, expect, it } from 'vitest';
 import {
   compile,
   contentHash,
-  estimate as estimateResources,
-  lowerBoolean,
-  lowerToReversible,
-  lowerToQuantum,
+  rebuild,
   seedFromHash,
   TraceRecorder,
   verify,
@@ -126,15 +123,18 @@ describe('re-verification of a stored artifact', () => {
 
     // What `POST /v1/compile/{id}/verify` does: rebuild from the stored spec and re-run the
     // checks. The verdict must not depend on anything that lived only in the first request.
+    //
+    // It calls the same `rebuild` the route calls, which is the whole point of that
+    // function existing — a test that reconstructed the pipeline by hand would keep
+    // passing while the route drifted, and drift is the only failure mode here.
     const trace = new TraceRecorder();
-    const module = lowerBoolean(entry.source, { moduleName: entry.name, trace });
-    const { circuit } = lowerToReversible(module, trace);
-    const quantum = lowerToQuantum(circuit, trace);
-    const report = verify(module, circuit, estimateResources(circuit, quantum), {
+    const built = rebuild({ kind: entry.kind, source: entry.source, name: entry.name }, trace);
+    const report = verify(built.module, built.circuit, built.estimate, {
       compilerVersion: original.compilerVersion,
       specHash: original.specHash,
       seed: seedFromHash(original.specHash),
-      quantum,
+      quantum: built.quantum,
+      optimization: built.optimization ?? undefined,
     });
 
     expect(report.passed).toBe(original.report.passed);

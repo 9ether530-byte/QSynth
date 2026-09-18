@@ -63,8 +63,27 @@ describe('a specification that verifies', () => {
 
   it('attributes time to each pipeline stage rather than to the request as a whole', async () => {
     const res = await call('GET', `/v1/compile/${passingJob.id}`, { auth: { token: org.token } });
-    expect(res.body.stages.map((s: { stage: string }) => s.stage)).toEqual(['parse', 'lower', 'decompose', 'estimate', 'verify', 'emit']);
+    expect(res.body.stages.map((s: { stage: string }) => s.stage)).toEqual([
+      'parse', 'lower', 'optimize', 'decompose', 'estimate', 'verify', 'emit',
+    ]);
     for (const stage of res.body.stages) expect(stage.status).toBe('ok');
+  });
+
+  it('records what the optimizer did, and that the guard discarded none of it', async () => {
+    const res = await call('GET', `/v1/compile/${passingJob.id}`, { auth: { token: org.token } });
+    const optimization = res.body.verification.optimization;
+    expect(optimization).not.toBeNull();
+    // The assertion that matters. A non-zero count means a pass rewrote the circuit
+    // wrongly and the guard threw the rewrite away — the artifact is still correct, which
+    // is exactly why nothing else would fail and why this has to be asserted explicitly.
+    expect(optimization.discarded).toBe(0);
+    expect(optimization.passes.map((p: { id: string }) => p.id)).toEqual([
+      'cancel-inverses', 'constant-fold', 'reuse-values', 'drop-unused-ancillas',
+    ]);
+    // The half adder computes `a AND b` twice, so this is the pass that has work to do.
+    expect(optimization.passes.find((p: { id: string }) => p.id === 'reuse-values').status).toBe('applied');
+    expect(optimization.after.gates).toBeLessThanOrEqual(optimization.before.gates);
+    expect(optimization.guard.mode).toBe('exhaustive');
   });
 
   it('keeps the reversible-layer figures apart from the Clifford+T ones, and says which were counted', async () => {

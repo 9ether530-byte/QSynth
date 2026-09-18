@@ -34,7 +34,7 @@ describe('the pipeline', () => {
   });
 
   it('attributes time to each stage in order', () => {
-    expect(result.stages.map((s) => s.stage)).toEqual(['parse', 'lower', 'decompose', 'estimate', 'verify', 'emit']);
+    expect(result.stages.map((s) => s.stage)).toEqual(['parse', 'lower', 'optimize', 'decompose', 'estimate', 'verify', 'emit']);
     expect(result.stages.every((s) => s.status === 'passed')).toBe(true);
     expect(result.stages.every((s) => s.durationMs >= 0)).toBe(true);
   });
@@ -200,7 +200,7 @@ describe('estimate-only path', () => {
   it('lowers and estimates without verifying, and produces no artifact', () => {
     const result = estimateOnly({ kind: 'boolean', source: SPEC });
     expect(result.estimate.qubits).toBeGreaterThan(0);
-    expect(result.stages.map((s) => s.stage)).toEqual(['parse', 'lower', 'estimate']);
+    expect(result.stages.map((s) => s.stage)).toEqual(['parse', 'lower', 'optimize', 'estimate']);
     expect(result).not.toHaveProperty('qasm');
     expect(result).not.toHaveProperty('report');
   });

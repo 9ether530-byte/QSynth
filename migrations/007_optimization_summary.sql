@@ -1,0 +1,24 @@
+-- ---------------------------------------------------------------------------
+-- 007: record what the optimizer did, and what it refused to do.
+--
+-- The compiler now runs a pass pipeline between lowering and decomposition, and
+-- every pass is re-checked against the unoptimized circuit before it is kept. A
+-- pass that changed the circuit's behaviour is discarded, the unoptimized
+-- circuit is carried forward, and the compile still succeeds.
+--
+-- That last sentence is why this column exists. A discarded pass is a defect in
+-- the optimizer that the guard contained — the artifact is correct, so nothing
+-- fails, and without somewhere to write it down the event would leave no trace
+-- at all. Storing the summary next to the report makes "the guard caught one"
+-- an answerable question months later, per job, rather than a line in a log
+-- that has since rotated away.
+--
+-- It also records the before/after shape per pass, which is what lets a user ask
+-- why their circuit is the size it is and get an answer naming the passes.
+--
+-- Nullable: rows written before the optimizer existed have no summary, and an
+-- empty object would claim the pipeline ran and found nothing. NULL says what is
+-- true — this job predates the column.
+-- ---------------------------------------------------------------------------
+
+alter table verification_reports add column optimization jsonb;

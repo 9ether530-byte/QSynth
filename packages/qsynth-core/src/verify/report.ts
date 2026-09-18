@@ -14,6 +14,7 @@
  * ran passed and no check was skipped for a reason other than "nothing to check".
  */
 import type { Bit } from '../eval/classical.js';
+import type { OptimizationSummary } from '../passes/types.js';
 
 export type CheckId =
   | 'type_shape'
@@ -89,11 +90,18 @@ export interface VerificationReport {
   /** Compiler version and spec hash, so a stored report is attributable. */
   readonly compilerVersion: string;
   readonly specHash: string;
+  /**
+   * What the optimizer did on the way to this circuit, when it ran (FR-3). A pass the
+   * equivalence guard discarded is recorded here, with the counterexample that caught it:
+   * the artifact is still correct, because the rewrite was thrown away, but a discarded
+   * pass is a defect in this compiler and the report is where that gets said out loud.
+   */
+  readonly optimization?: OptimizationSummary;
 }
 
 export function buildReport(
   results: readonly CheckResult[],
-  meta: { compilerVersion: string; specHash: string; durationMs: number },
+  meta: { compilerVersion: string; specHash: string; durationMs: number; optimization?: OptimizationSummary },
 ): VerificationReport {
   const failed = results.find((r) => r.status === 'failed');
   const reached = results.filter((r) => r.status !== 'skipped').map((r) => r.id);
@@ -105,6 +113,7 @@ export function buildReport(
     durationMs: meta.durationMs,
     compilerVersion: meta.compilerVersion,
     specHash: meta.specHash,
+    ...(meta.optimization ? { optimization: meta.optimization } : {}),
   };
 }
 

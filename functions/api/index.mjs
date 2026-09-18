@@ -2301,7 +2301,7 @@ function lowerNode(module, node, builder, nodeWire, trace) {
   const firstGate = builder.gateCount;
   const emit = (kind, wires) => builder.emit(kind, wires, { span: node.span, nodeId: node.id });
   const copy = (a) => emit("cnot", [a, target]);
-  const flip = () => emit("x", [target]);
+  const flip2 = () => emit("x", [target]);
   const and2 = (a, b) => a === b ? copy(a) : emit("ccnot", [a, b, target]);
   const xor2 = (a, b) => {
     if (a === b) return;
@@ -2310,25 +2310,25 @@ function lowerNode(module, node, builder, nodeWire, trace) {
   };
   switch (node.op) {
     case "const":
-      if (node.value === 1) flip();
+      if (node.value === 1) flip2();
       break;
     case "not":
       copy(operand(0));
-      flip();
+      flip2();
       break;
     case "and":
       and2(operand(0), operand(1));
       break;
     case "nand":
       and2(operand(0), operand(1));
-      flip();
+      flip2();
       break;
     case "xor":
       xor2(operand(0), operand(1));
       break;
     case "xnor":
       xor2(operand(0), operand(1));
-      flip();
+      flip2();
       break;
     case "or":
       and2(operand(0), operand(1));
@@ -2337,7 +2337,7 @@ function lowerNode(module, node, builder, nodeWire, trace) {
     case "nor":
       and2(operand(0), operand(1));
       xor2(operand(0), operand(1));
-      flip();
+      flip2();
       break;
     case "mux": {
       const [s, x, y] = [operand(0), operand(1), operand(2)];
@@ -3120,9 +3120,9 @@ var MAX_GATES_PER_NODE = 4;
 function projectGateCount(nodeCount, outputCount) {
   return nodeCount * MAX_GATES_PER_NODE * 2 + outputCount;
 }
-function projectVerificationOps(inputCount, projectedGates, exhaustiveLimit) {
+function projectVerificationOps(inputCount, projectedGates, exhaustiveLimit, sweeps = 1) {
   const runs = inputCount <= exhaustiveLimit ? 2 ** inputCount : 2 ** exhaustiveLimit;
-  return runs * projectedGates;
+  return runs * projectedGates * sweeps;
 }
 
 // packages/qsynth-core/src/emit/qasm3.ts
@@ -3218,7 +3218,8 @@ function buildReport(results, meta) {
     stoppedAt: failed?.id,
     durationMs: meta.durationMs,
     compilerVersion: meta.compilerVersion,
-    specHash: meta.specHash
+    specHash: meta.specHash,
+    ...meta.optimization ? { optimization: meta.optimization } : {}
   };
 }
 function skipped(id, reason) {
@@ -3251,6 +3252,39 @@ var Rng = class {
 };
 function seedFromHash(hex) {
   return parseInt(hex.slice(0, 8), 16) >>> 0;
+}
+
+// packages/qsynth-core/src/verify/plan.ts
+var DEFAULT_SAMPLE_COUNT = 4096;
+function planAssignments(module, options) {
+  const n = module.inputs.length;
+  const space = 2 ** n;
+  const dontCare = new Set(module.dontCare);
+  const limit = options.exhaustiveLimit ?? EXHAUSTIVE_INPUT_LIMIT;
+  if (n <= limit) {
+    const assignments2 = [];
+    for (let a = 0; a < space; a++) if (!dontCare.has(a)) assignments2.push(a);
+    return {
+      assignments: assignments2,
+      coverage: { mode: "exhaustive", checked: assignments2.length, space, dontCare: dontCare.size }
+    };
+  }
+  const seed = options.seed ?? 1;
+  const rng = new Rng(seed);
+  const wanted = options.sampleCount ?? DEFAULT_SAMPLE_COUNT;
+  const seen = /* @__PURE__ */ new Set();
+  const assignments = [];
+  for (let attempts = 0; attempts < wanted * 4 && assignments.length < wanted; attempts++) {
+    let a = 0;
+    for (let bit = 0; bit < n; bit++) if (rng.bit() === 1) a += 2 ** bit;
+    if (dontCare.has(a) || seen.has(a)) continue;
+    seen.add(a);
+    assignments.push(a);
+  }
+  return {
+    assignments,
+    coverage: { mode: "sampled", checked: assignments.length, space, dontCare: dontCare.size, seed }
+  };
 }
 
 // packages/qsynth-core/src/verify/checks.ts
@@ -3288,7 +3322,8 @@ function verify(module, circuit, estimate3, options) {
   return buildReport(results, {
     compilerVersion: options.compilerVersion,
     specHash: options.specHash,
-    durationMs: now() - started
+    durationMs: now() - started,
+    optimization: options.optimization
   });
 }
 function checkTypeShape(module, circuit) {
@@ -3336,36 +3371,6 @@ function checkTypeShape(module, circuit) {
     summary: problems.length === 0 ? `${module.inputs.length} input bit(s), ${module.outputs.length} output(s) and ${circuit.gates.length} gates are consistently shaped, and no gate writes to an input wire.` : `${problems.length} shape problem(s) found; the first is: ${problems[0]}.`,
     durationMs: now() - started,
     evidence: problems.length === 0 ? void 0 : { problems: problems.slice(0, 20), total: problems.length }
-  };
-}
-function planAssignments(module, options) {
-  const n = module.inputs.length;
-  const space = 2 ** n;
-  const dontCare = new Set(module.dontCare);
-  const limit = options.exhaustiveLimit ?? EXHAUSTIVE_INPUT_LIMIT;
-  if (n <= limit) {
-    const assignments2 = [];
-    for (let a = 0; a < space; a++) if (!dontCare.has(a)) assignments2.push(a);
-    return {
-      assignments: assignments2,
-      coverage: { mode: "exhaustive", checked: assignments2.length, space, dontCare: dontCare.size }
-    };
-  }
-  const seed = options.seed ?? 1;
-  const rng = new Rng(seed);
-  const wanted = options.sampleCount ?? 4096;
-  const seen = /* @__PURE__ */ new Set();
-  const assignments = [];
-  for (let attempts = 0; attempts < wanted * 4 && assignments.length < wanted; attempts++) {
-    let a = 0;
-    for (let bit = 0; bit < n; bit++) if (rng.bit() === 1) a += 2 ** bit;
-    if (dontCare.has(a) || seen.has(a)) continue;
-    seen.add(a);
-    assignments.push(a);
-  }
-  return {
-    assignments,
-    coverage: { mode: "sampled", checked: assignments.length, space, dontCare: dontCare.size, seed }
   };
 }
 function namedInputs(module, bits) {
@@ -3600,12 +3605,502 @@ function now() {
   return performance.now();
 }
 
+// packages/qsynth-core/src/passes/rewrite.ts
+function rewriteGates(circuit, rewrites) {
+  assertInvariant(
+    rewrites.length === circuit.gates.length,
+    `rewrite plan has ${rewrites.length} entries for ${circuit.gates.length} gates`
+  );
+  const gates = [];
+  const survivorsBefore = new Int32Array(rewrites.length + 1);
+  for (let i = 0; i < rewrites.length; i++) {
+    survivorsBefore[i] = gates.length;
+    const gate = rewrites[i];
+    if (gate !== null) gates.push(gate);
+  }
+  survivorsBefore[rewrites.length] = gates.length;
+  if (gates.length === circuit.gates.length && rewrites.every((g, i) => g === circuit.gates[i])) {
+    return circuit;
+  }
+  const at = (index) => survivorsBefore[Math.min(Math.max(index, 0), rewrites.length)];
+  const ancillas = circuit.ancillas.map((record) => ({
+    ...record,
+    allocatedAtGate: at(record.allocatedAtGate),
+    uncomputedAtGate: record.uncomputedAtGate === null ? null : at(record.uncomputedAtGate),
+    releasedAtGate: record.releasedAtGate === null ? null : at(record.releasedAtGate)
+  }));
+  return { ...circuit, gates, ancillas };
+}
+function dropWires(circuit, remove2) {
+  if (remove2.size === 0) return circuit;
+  const renumbered = new Int32Array(circuit.wires.length).fill(-1);
+  const wires = [];
+  for (const wire of circuit.wires) {
+    if (remove2.has(wire.index)) continue;
+    renumbered[wire.index] = wires.length;
+    wires.push({ ...wire, index: wires.length });
+  }
+  const map = (wire) => {
+    const next = renumbered[wire] ?? -1;
+    assertInvariant(next >= 0, `wire ${wire} was removed but is still referenced`);
+    return next;
+  };
+  return {
+    ...circuit,
+    wires,
+    gates: circuit.gates.map((gate) => ({ ...gate, wires: gate.wires.map(map) })),
+    inputs: circuit.inputs.map((input) => ({ ...input, wire: map(input.wire) })),
+    outputs: circuit.outputs.map((output) => ({ ...output, wire: map(output.wire) })),
+    ancillas: circuit.ancillas.filter((a) => !remove2.has(a.wire)).map((a) => ({ ...a, wire: map(a.wire) }))
+  };
+}
+
+// packages/qsynth-core/src/passes/cancelInverses.ts
+function signature(gate) {
+  const w = gate.wires;
+  switch (gate.kind) {
+    case "x":
+      return `x ${w[0]}`;
+    case "cnot":
+      return `cnot ${w[0]}>${w[1]}`;
+    case "ccnot": {
+      const controls = [w[0], w[1]].sort((a, b) => a - b);
+      return `ccnot ${controls[0]},${controls[1]}>${w[2]}`;
+    }
+    case "cswap": {
+      const targets = [w[1], w[2]].sort((a, b) => a - b);
+      return `cswap ${w[0]}>${targets[0]},${targets[1]}`;
+    }
+  }
+}
+function commutes(a, b) {
+  for (const target of targetsOf(a)) if (b.wires.includes(target)) return false;
+  for (const target of targetsOf(b)) if (a.wires.includes(target)) return false;
+  return true;
+}
+var cancelInverses = {
+  id: "cancel-inverses",
+  title: "Cancel self-inverse pairs",
+  rationale: "Every gate in the reversible IR is its own inverse, so two matching gates separated only by gates that commute with them can both be removed.",
+  run(circuit) {
+    const gates = circuit.gates;
+    const rewrites = [...gates];
+    const signatures = gates.map(signature);
+    for (let i = 0; i < gates.length; i++) {
+      if (rewrites[i] === null) continue;
+      for (let j = i + 1; j < gates.length; j++) {
+        if (rewrites[j] === null) continue;
+        if (signatures[i] === signatures[j]) {
+          rewrites[i] = null;
+          rewrites[j] = null;
+          break;
+        }
+        if (!commutes(gates[i], gates[j])) break;
+      }
+    }
+    return rewriteGates(circuit, rewrites);
+  }
+};
+
+// packages/qsynth-core/src/passes/constantFold.ts
+var flip = (value) => value === null ? null : value === 0 ? 1 : 0;
+var asGate = (from, kind, wires) => ({
+  kind,
+  wires: [...wires],
+  span: from.span,
+  nodeId: from.nodeId
+});
+var constantFold = {
+  id: "constant-fold",
+  title: "Fold constant controls",
+  rationale: "Ancillas begin at |0\u27E9, so a gate controlled by one that has not been written yet cannot fire and is removed, and a control known to be |1\u27E9 is dropped from the gate entirely.",
+  run(circuit) {
+    const known = circuit.wires.map((wire) => wire.role === "input" ? null : 0);
+    const rewrites = [];
+    for (const gate of circuit.gates) {
+      const w = gate.wires;
+      switch (gate.kind) {
+        case "x": {
+          const target = w[0];
+          known[target] = flip(known[target]);
+          rewrites.push(gate);
+          break;
+        }
+        case "cnot": {
+          const control = w[0];
+          const target = w[1];
+          if (known[control] === 0) {
+            rewrites.push(null);
+          } else if (known[control] === 1) {
+            known[target] = flip(known[target]);
+            rewrites.push(asGate(gate, "x", [target]));
+          } else {
+            known[target] = null;
+            rewrites.push(gate);
+          }
+          break;
+        }
+        case "ccnot": {
+          const a = w[0];
+          const b = w[1];
+          const target = w[2];
+          if (known[a] === 0 || known[b] === 0) {
+            rewrites.push(null);
+          } else if (known[a] === 1 && known[b] === 1) {
+            known[target] = flip(known[target]);
+            rewrites.push(asGate(gate, "x", [target]));
+          } else if (known[a] === 1 || known[b] === 1) {
+            known[target] = null;
+            rewrites.push(asGate(gate, "cnot", [known[a] === 1 ? b : a, target]));
+          } else {
+            known[target] = null;
+            rewrites.push(gate);
+          }
+          break;
+        }
+        case "cswap": {
+          const control = w[0];
+          const a = w[1];
+          const b = w[2];
+          if (known[control] === 0) {
+            rewrites.push(null);
+          } else if (known[control] === 1) {
+            const held = known[a];
+            known[a] = known[b];
+            known[b] = held;
+            rewrites.push(gate);
+          } else {
+            known[a] = null;
+            known[b] = null;
+            rewrites.push(gate);
+          }
+          break;
+        }
+      }
+    }
+    return rewriteGates(circuit, rewrites);
+  }
+};
+
+// packages/qsynth-core/src/passes/reuseValues.ts
+var COST_RANK = { x: 1, cnot: 2, ccnot: 3, cswap: 3 };
+var ValueTable = class _ValueTable {
+  words;
+  values;
+  /**
+   * The constant-one function. Fewer than 32 rows leaves spare bits in the last word, and
+   * they are held at zero throughout rather than left as don't-cares: two wires that agree
+   * on every real row must compare equal, and padding that differed between them would
+   * silently cost a rewrite.
+   */
+  ones;
+  /** Value key → the wires currently holding it. Lets a lookup be a hash, not a scan. */
+  holders = /* @__PURE__ */ new Map();
+  keys;
+  constructor(circuit, inputCount) {
+    const rows = 2 ** inputCount;
+    this.words = Math.max(1, Math.ceil(rows / 32));
+    this.values = circuit.wires.map(() => new Uint32Array(this.words));
+    this.ones = new Uint32Array(this.words);
+    for (let row = 0; row < rows; row++) this.ones[row >>> 5] |= 1 << (row & 31);
+    circuit.inputs.forEach((input, k) => {
+      const mask = this.values[input.wire];
+      for (let row = 0; row < rows; row++) {
+        if (row >> k & 1) mask[row >>> 5] |= 1 << (row & 31);
+      }
+    });
+    this.keys = this.values.map((mask) => _ValueTable.key(mask));
+    this.keys.forEach((key, wire) => this.index(key, wire));
+  }
+  /** The constant-one function, for an X gate's effect. */
+  allOnes() {
+    return this.ones;
+  }
+  static key(mask) {
+    let text = "";
+    for (const word of mask) text += word.toString(36) + ".";
+    return text;
+  }
+  index(key, wire) {
+    const set = this.holders.get(key);
+    if (set) set.add(wire);
+    else this.holders.set(key, /* @__PURE__ */ new Set([wire]));
+  }
+  valueOf(wire) {
+    return this.values[wire];
+  }
+  scratch() {
+    return new Uint32Array(this.words);
+  }
+  isZero(mask) {
+    for (const word of mask) if (word !== 0) return false;
+    return true;
+  }
+  isOne(mask) {
+    return this.equal(mask, this.ones);
+  }
+  equal(a, b) {
+    for (let i = 0; i < this.words; i++) if (a[i] !== b[i]) return false;
+    return true;
+  }
+  /** Any wire other than `exclude` whose value is `mask`, or -1. */
+  holderOf(mask, exclude) {
+    const set = this.holders.get(_ValueTable.key(mask));
+    if (!set) return -1;
+    for (const wire of set) if (wire !== exclude) return wire;
+    return -1;
+  }
+  /** `wire ^= delta`, keeping the index current. */
+  xorInto(wire, delta) {
+    const value = this.values[wire];
+    for (let i = 0; i < this.words; i++) value[i] ^= delta[i];
+    this.reindex(wire);
+  }
+  reindex(wire) {
+    this.holders.get(this.keys[wire])?.delete(wire);
+    const key = _ValueTable.key(this.values[wire]);
+    this.keys[wire] = key;
+    this.index(key, wire);
+  }
+};
+var asGate2 = (from, kind, wires) => ({
+  kind,
+  wires: [...wires],
+  span: from.span,
+  nodeId: from.nodeId
+});
+var reuseValues = {
+  id: "reuse-values",
+  title: "Reuse values already on the wires",
+  rationale: "A gate whose effect is a value some other wire already holds is a CNOT from that wire, which turns a seven-T Toffoli into a single Clifford gate.",
+  run(circuit) {
+    const inputCount = circuit.inputs.length;
+    if (inputCount > EXHAUSTIVE_INPUT_LIMIT) return circuit;
+    const table = new ValueTable(circuit, inputCount);
+    const rewrites = [];
+    const delta = table.scratch();
+    for (const gate of circuit.gates) {
+      const w = gate.wires;
+      if (gate.kind === "cswap") {
+        const control = table.valueOf(w[0]);
+        const a = table.valueOf(w[1]);
+        const b = table.valueOf(w[2]);
+        if (table.isZero(control) || table.equal(a, b)) {
+          rewrites.push(null);
+          continue;
+        }
+        const swing = table.scratch();
+        for (let i = 0; i < swing.length; i++) swing[i] = control[i] & (a[i] ^ b[i]);
+        rewrites.push(gate);
+        table.xorInto(w[1], swing);
+        table.xorInto(w[2], swing);
+        continue;
+      }
+      const target = w[w.length - 1];
+      switch (gate.kind) {
+        case "x":
+          delta.set(table.allOnes());
+          break;
+        case "cnot":
+          delta.set(table.valueOf(w[0]));
+          break;
+        case "ccnot": {
+          const a = table.valueOf(w[0]);
+          const b = table.valueOf(w[1]);
+          for (let i = 0; i < delta.length; i++) delta[i] = a[i] & b[i];
+          break;
+        }
+      }
+      const rank = COST_RANK[gate.kind];
+      if (table.isZero(delta)) {
+        rewrites.push(null);
+        continue;
+      }
+      if (table.isOne(delta) && rank > COST_RANK.x) {
+        rewrites.push(asGate2(gate, "x", [target]));
+      } else if (rank > COST_RANK.cnot) {
+        const source = table.holderOf(delta, target);
+        rewrites.push(source >= 0 ? asGate2(gate, "cnot", [source, target]) : gate);
+      } else {
+        rewrites.push(gate);
+      }
+      table.xorInto(target, delta);
+    }
+    return rewriteGates(circuit, rewrites);
+  }
+};
+
+// packages/qsynth-core/src/passes/dropUnusedAncillas.ts
+var dropUnusedAncillas = {
+  id: "drop-unused-ancillas",
+  title: "Drop untouched ancillas",
+  rationale: "An ancilla no gate references holds |0\u27E9 for the whole circuit, so removing it lowers the qubit count without changing what the circuit computes.",
+  run(circuit) {
+    const touched = /* @__PURE__ */ new Set();
+    for (const gate of circuit.gates) for (const wire of gate.wires) touched.add(wire);
+    const remove2 = /* @__PURE__ */ new Set();
+    for (const wire of circuit.wires) {
+      if (wire.role === "ancilla" && !touched.has(wire.index)) remove2.add(wire.index);
+    }
+    return dropWires(circuit, remove2);
+  }
+};
+
+// packages/qsynth-core/src/passes/runner.ts
+var OPTIMIZATION_PASSES = [
+  cancelInverses,
+  constantFold,
+  reuseValues,
+  dropUnusedAncillas
+];
+function observe(circuit, bits) {
+  const result = simulate(circuit, bits);
+  return {
+    outputs: result.outputs,
+    inputsAtEnd: result.inputsAtEnd,
+    dirtyAncillas: result.ancillasAtEnd.reduce((n, value) => n + (value === 0 ? 0 : 1), 0)
+  };
+}
+function shapeOf(circuit) {
+  return { qubits: circuit.wires.length, gates: circuit.gates.length, depth: depth(circuit) };
+}
+function named(names, bits) {
+  const record = {};
+  names.forEach((entry, i) => record[entry.name] = bits[i]);
+  return record;
+}
+function findDivergence(module, reference, candidate, plan) {
+  for (let i = 0; i < plan.assignments.length; i++) {
+    const assignment = plan.assignments[i];
+    const bits = assignmentToBits(assignment, module.inputs.length);
+    const before = reference[i];
+    const after = observe(candidate, bits);
+    const inputs = named(module.inputs, bits);
+    const outputNames = candidate.outputs;
+    for (let w = 0; w < before.outputs.length; w++) {
+      if (before.outputs[w] !== after.outputs[w]) {
+        return {
+          assignment,
+          inputs,
+          expected: named(outputNames, before.outputs),
+          observed: named(outputNames, after.outputs),
+          detail: `output "${outputNames[w].name}" changed from ${before.outputs[w]} to ${after.outputs[w]}.`
+        };
+      }
+    }
+    for (let w = 0; w < before.inputsAtEnd.length; w++) {
+      if (before.inputsAtEnd[w] !== after.inputsAtEnd[w]) {
+        return {
+          assignment,
+          inputs,
+          expected: named(module.inputs, before.inputsAtEnd),
+          observed: named(module.inputs, after.inputsAtEnd),
+          detail: `input "${module.inputs[w].name}" no longer holds its original value at the end of the circuit, so the rewrite broke the Bennett form.`
+        };
+      }
+    }
+    if (before.dirtyAncillas !== after.dirtyAncillas) {
+      return {
+        assignment,
+        inputs,
+        expected: named(outputNames, before.outputs),
+        observed: named(outputNames, after.outputs),
+        detail: `${after.dirtyAncillas} ancilla(s) finished dirty where ${before.dirtyAncillas} did before the rewrite, so the rewrite leaked or stranded state.`
+      };
+    }
+  }
+  return null;
+}
+function optimize(module, circuit, options) {
+  const passes = options.passes ?? OPTIMIZATION_PASSES;
+  const plan = options.plan;
+  const before = shapeOf(circuit);
+  const reference = plan.assignments.map(
+    (assignment) => observe(circuit, assignmentToBits(assignment, module.inputs.length))
+  );
+  let current = circuit;
+  const outcomes = [];
+  for (const pass of passes) {
+    const started = performance.now();
+    const shapeBefore = shapeOf(current);
+    const candidate = pass.run(current);
+    const shapeAfter = shapeOf(candidate);
+    const unchanged = candidate === current || shapeAfter.gates === shapeBefore.gates && shapeAfter.qubits === shapeBefore.qubits && candidate.gates.every((gate, i) => gate === current.gates[i]);
+    if (unchanged) {
+      outcomes.push({
+        id: pass.id,
+        title: pass.title,
+        status: "no_change",
+        summary: `${pass.title} found nothing to rewrite.`,
+        before: shapeBefore,
+        after: shapeAfter,
+        durationMs: performance.now() - started
+      });
+      continue;
+    }
+    const divergence = findDivergence(module, reference, candidate, plan);
+    if (divergence) {
+      outcomes.push({
+        id: pass.id,
+        title: pass.title,
+        status: "discarded",
+        summary: `${pass.title} changed what the circuit computes and was discarded; the unoptimized circuit was kept. ${divergence.detail}`,
+        before: shapeBefore,
+        after: shapeBefore,
+        durationMs: performance.now() - started,
+        divergence
+      });
+      options.trace?.add({
+        phase: "optimize",
+        kind: "pass.discarded",
+        message: `${pass.title} was discarded: it changed the circuit's behaviour on input assignment ${divergence.assignment}. ${divergence.detail} The circuit before the pass was kept, so the result is still correct \u2014 but this is a defect in the optimizer.`,
+        detail: { pass: pass.id, assignment: divergence.assignment }
+      });
+      continue;
+    }
+    current = candidate;
+    outcomes.push({
+      id: pass.id,
+      title: pass.title,
+      status: "applied",
+      summary: `${pass.title}: ${shapeBefore.gates} \u2192 ${shapeAfter.gates} gate(s), ${shapeBefore.qubits} \u2192 ${shapeAfter.qubits} qubit(s), depth ${shapeBefore.depth} \u2192 ${shapeAfter.depth}.`,
+      before: shapeBefore,
+      after: shapeAfter,
+      durationMs: performance.now() - started
+    });
+    options.trace?.add({
+      phase: "optimize",
+      kind: "pass.applied",
+      // No durations in the trace: it is stored as a content-addressed artifact, and a
+      // wall-clock number would give the same compilation a different hash every run.
+      message: `${pass.title} removed ${shapeBefore.gates - shapeAfter.gates} gate(s) and ${shapeBefore.qubits - shapeAfter.qubits} qubit(s). ${pass.rationale} The rewrite was re-checked against the unoptimized circuit on ${plan.coverage.checked} input assignment(s) before being kept.`,
+      detail: { pass: pass.id, before: shapeBefore, after: shapeAfter }
+    });
+  }
+  return {
+    circuit: current,
+    summary: {
+      guard: {
+        mode: plan.coverage.mode,
+        checked: plan.coverage.checked,
+        space: plan.coverage.space,
+        ...plan.coverage.seed === void 0 ? {} : { seed: plan.coverage.seed }
+      },
+      passes: outcomes,
+      discarded: outcomes.filter((o) => o.status === "discarded").length,
+      before,
+      after: shapeOf(current)
+    }
+  };
+}
+
 // packages/qsynth-core/src/compile.ts
 var SPEC_KINDS = ["boolean", "truthtable"];
 var MAX_VERIFICATION_OPS = 5e7;
+var VERIFICATION_SWEEPS = 3 + 1 + OPTIMIZATION_PASSES.length;
 function preflight(module) {
   const projectedGates = projectGateCount(module.nodes.length, module.outputs.length);
-  const ops = projectVerificationOps(module.inputs.length, projectedGates, EXHAUSTIVE_INPUT_LIMIT);
+  const ops = projectVerificationOps(module.inputs.length, projectedGates, EXHAUSTIVE_INPUT_LIMIT, VERIFICATION_SWEEPS);
   const accepted = ops <= MAX_VERIFICATION_OPS;
   return {
     accepted,
@@ -3632,27 +4127,9 @@ function parseSpec(request, trace) {
       );
   }
 }
-function compile(request) {
-  const started = performance.now();
-  const trace = new TraceRecorder();
-  const stages = [];
+var runDirectly = (_name, fn) => fn();
+function rebuild(request, trace, stage = runDirectly) {
   const specHash = contentHash({ kind: request.kind, source: request.source });
-  const stage = (name, fn) => {
-    const stageStarted = performance.now();
-    try {
-      const value = fn();
-      stages.push({ stage: name, status: "passed", durationMs: performance.now() - stageStarted });
-      return value;
-    } catch (error) {
-      stages.push({
-        stage: name,
-        status: "failed",
-        durationMs: performance.now() - stageStarted,
-        errorCode: error instanceof QsynthError ? error.code : "INTERNAL"
-      });
-      throw error;
-    }
-  };
   const module = stage("parse", () => {
     const parsed = parseSpec(request, trace);
     const check = preflight(parsed);
@@ -3672,7 +4149,13 @@ function compile(request) {
     });
     return parsed;
   });
-  const { circuit } = stage("lower", () => lowerToReversible(module, trace));
+  const { circuit: lowered } = stage("lower", () => lowerToReversible(module, trace));
+  const plan = planAssignments(module, { sampleCount: request.sampleCount, seed: seedFromHash(specHash) });
+  const optimized = stage(
+    "optimize",
+    () => request.optimize === false ? null : optimize(module, lowered, { plan, trace })
+  );
+  const circuit = optimized?.circuit ?? lowered;
   const quantum = stage("decompose", () => lowerToQuantum(circuit, trace));
   const resourceEstimate = stage("estimate", () => {
     const value = estimate(circuit, quantum);
@@ -3684,16 +4167,49 @@ function compile(request) {
     });
     return value;
   });
+  return {
+    module,
+    circuit,
+    unoptimized: lowered,
+    optimization: optimized?.summary ?? null,
+    quantum,
+    estimate: resourceEstimate,
+    specHash
+  };
+}
+function compile(request) {
+  const started = performance.now();
+  const trace = new TraceRecorder();
+  const stages = [];
+  const stage = (name, fn) => {
+    const stageStarted = performance.now();
+    try {
+      const value = fn();
+      stages.push({ stage: name, status: "passed", durationMs: performance.now() - stageStarted });
+      return value;
+    } catch (error) {
+      stages.push({
+        stage: name,
+        status: "failed",
+        durationMs: performance.now() - stageStarted,
+        errorCode: error instanceof QsynthError ? error.code : "INTERNAL"
+      });
+      throw error;
+    }
+  };
+  const built = rebuild(request, trace, stage);
+  const { module, circuit, quantum, specHash } = built;
   const report = stage(
     "verify",
-    () => verify(module, circuit, resourceEstimate, {
+    () => verify(module, circuit, built.estimate, {
       budget: request.budget,
       compilerVersion: COMPILER_VERSION,
       specHash,
       sampleCount: request.sampleCount,
       seed: seedFromHash(specHash),
       quantum,
-      trace
+      trace,
+      optimization: built.optimization ?? void 0
     })
   );
   const qasm = stage("emit", () => {
@@ -3707,16 +4223,12 @@ function compile(request) {
     return text;
   });
   return {
-    module,
-    circuit,
-    quantum,
-    estimate: resourceEstimate,
+    ...built,
     report,
     qasm,
     gateList: gateListText(circuit),
     trace: trace.toArray(),
     stages,
-    specHash,
     artifactHash: contentHash(qasm),
     compilerVersion: COMPILER_VERSION,
     durationMs: performance.now() - started
@@ -3732,12 +4244,26 @@ function estimateOnly(request) {
   stages.push({ stage: "parse", status: "passed", durationMs: performance.now() - parseStarted });
   const check = preflight(module);
   const lowerStarted = performance.now();
-  const { circuit } = lowerToReversible(module, trace);
+  const { circuit: lowered } = lowerToReversible(module, trace);
   stages.push({ stage: "lower", status: "passed", durationMs: performance.now() - lowerStarted });
+  const optimizeStarted = performance.now();
+  const optimized = request.optimize === false || !check.accepted ? null : optimize(module, lowered, {
+    plan: planAssignments(module, { sampleCount: request.sampleCount, seed: seedFromHash(specHash) }),
+    trace
+  });
+  stages.push({ stage: "optimize", status: "passed", durationMs: performance.now() - optimizeStarted });
+  const circuit = optimized?.circuit ?? lowered;
   const estimateStarted = performance.now();
   const value = estimate(circuit);
   stages.push({ stage: "estimate", status: "passed", durationMs: performance.now() - estimateStarted });
-  return { estimate: value, preflight: check, stages, specHash, durationMs: performance.now() - started };
+  return {
+    estimate: value,
+    preflight: check,
+    optimization: optimized?.summary ?? null,
+    stages,
+    specHash,
+    durationMs: performance.now() - started
+  };
 }
 
 // functions/api/src/storage.ts
@@ -3900,7 +4426,13 @@ var reportView = (report) => ({
   stoppedAt: report.stoppedAt ?? null,
   durationMs: report.durationMs,
   compilerVersion: report.compilerVersion,
-  specHash: report.specHash
+  specHash: report.specHash,
+  // Reported next to the verdict rather than next to the resource figures, because the
+  // one thing a caller must be able to see is `discarded` — a non-zero count means a pass
+  // rewrote the circuit wrongly and the guard threw the rewrite away. The compile still
+  // succeeded and the artifact is still correct, so nothing else in this response would
+  // hint that it happened.
+  optimization: report.optimization ?? null
 });
 function methodOf(report) {
   const coverage = report.checks.find((c) => c.id === "simulation_equivalence")?.coverage;
@@ -4085,9 +4617,18 @@ async function run2(ctx) {
     await recordStages(tx, orgId, jobId, result.stages);
     await recordEvent(tx, orgId, jobId, null, status, { durationMs: Math.round(result.durationMs), artifactHash: result.artifactHash });
     await tx.query(
-      `insert into verification_reports (org_id, job_id, passed, method, sample_count, seed, checks)
-       values ($1,$2,$3,$4,$5,$6,$7)`,
-      [orgId, jobId, result.report.passed, method, usedSamples, seedFromHash(specHash), JSON.stringify(result.report.checks)]
+      `insert into verification_reports (org_id, job_id, passed, method, sample_count, seed, checks, optimization)
+       values ($1,$2,$3,$4,$5,$6,$7,$8)`,
+      [
+        orgId,
+        jobId,
+        result.report.passed,
+        method,
+        usedSamples,
+        seedFromHash(specHash),
+        JSON.stringify(result.report.checks),
+        result.optimization ? JSON.stringify(result.optimization) : null
+      ]
     );
     const e = result.estimate;
     await tx.query(
@@ -4155,6 +4696,9 @@ async function estimate2(ctx) {
     preflight: result.preflight,
     resources: resourceView(result.estimate),
     stages: result.stages,
+    // Null when the spec was refused at pre-flight: the figures are then the unoptimized
+    // ones, and saying so is the difference between an estimate and a guess.
+    optimization: result.optimization,
     durationMs: result.durationMs,
     verified: false
   });
@@ -4185,10 +4729,7 @@ async function get2(ctx) {
       "select stage, status, duration_ms, error_code from compile_stages where job_id = $1 order by ordinal",
       [id]
     );
-    const report = await tx.one(
-      "select passed, method, sample_count, seed, checks from verification_reports where job_id = $1",
-      [id]
-    );
+    const report = await tx.one("select passed, method, sample_count, seed, checks, optimization from verification_reports where job_id = $1", [id]);
     const resources = await tx.one(
       `select qubits, ancillas, depth, gate_count, two_qubit_count, t_count, t_depth, clifford_gate_count
          from resource_estimates where job_id = $1`,
@@ -4218,7 +4759,11 @@ async function get2(ctx) {
       seed: Number(data.report.seed),
       checks: data.report.checks,
       checksReached: data.report.checks.filter((c) => c.status !== "skipped").map((c) => c.id),
-      stoppedAt: data.report.checks.find((c) => c.status === "failed")?.id ?? null
+      stoppedAt: data.report.checks.find((c) => c.status === "failed")?.id ?? null,
+      // NULL here means the job predates the optimizer, not that it ran and did
+      // nothing — a pipeline that found nothing still writes a summary with four
+      // `no_change` outcomes.
+      optimization: data.report.optimization
     } : null,
     // The same two-object split the compile response uses, rebuilt from the stored row.
     //
@@ -4272,17 +4817,19 @@ async function reverify(ctx) {
   const budget = parseBudget(loaded.spec.budgets);
   const report = withCompilerErrors(() => {
     const trace = new TraceRecorder();
-    const module = parseSpec({ kind, source: loaded.spec.source, name: loaded.spec.name }, trace);
-    const { circuit } = lowerToReversible(module, trace);
-    const quantum = lowerToQuantum(circuit, trace);
-    return verify(module, circuit, estimate(circuit, quantum), {
+    const built = rebuild(
+      { kind, source: loaded.spec.source, name: loaded.spec.name, budget, sampleCount: loaded.stored.sample_count ?? void 0 },
+      trace
+    );
+    return verify(built.module, built.circuit, built.estimate, {
       budget,
       compilerVersion: COMPILER_VERSION,
       specHash: loaded.job.spec_hash,
       sampleCount: loaded.stored.sample_count ?? void 0,
       seed: Number(loaded.job.seed),
-      quantum,
-      trace
+      quantum: built.quantum,
+      trace,
+      optimization: built.optimization ?? void 0
     });
   });
   const before = new Map(loaded.stored.checks.map((c) => [c.id, c]));

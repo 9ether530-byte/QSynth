@@ -200,8 +200,22 @@ export function projectGateCount(nodeCount: number, outputCount: number): number
   return nodeCount * MAX_GATES_PER_NODE * 2 + outputCount;
 }
 
-/** Simulation work for the equivalence check: assignments × gates. */
-export function projectVerificationOps(inputCount: number, projectedGates: number, exhaustiveLimit: number): number {
+/**
+ * Simulation work a compile will do: assignments × gates × sweeps.
+ *
+ * `sweeps` is how many times the pipeline runs the whole circuit over the whole plan —
+ * one per check that simulates, plus the optimizer's guard. It defaults to one so a
+ * caller asking only "what does a single pass over this cost" gets that, but the
+ * pre-flight check passes the real figure: a projection that counted one sweep of a
+ * pipeline that performs several would refuse only the specs that are several times too
+ * large, and quietly accept the ones in between.
+ */
+export function projectVerificationOps(
+  inputCount: number,
+  projectedGates: number,
+  exhaustiveLimit: number,
+  sweeps = 1,
+): number {
   const runs = inputCount <= exhaustiveLimit ? 2 ** inputCount : 2 ** exhaustiveLimit;
-  return runs * projectedGates;
+  return runs * projectedGates * sweeps;
 }
