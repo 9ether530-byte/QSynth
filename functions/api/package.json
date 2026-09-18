@@ -1,4 +1,10 @@
 {
+  "name": "qsynth-api-fn",
+  "private": true,
   "type": "module",
-  "dependencies": {}
+  "description": "Deployed Lambda bundle. index.mjs is esbuild output from src/ — do not edit it by hand.",
+  "main": "index.mjs",
+  "dependencies": {
+    "pg": "^8.13.1"
+  }
 }

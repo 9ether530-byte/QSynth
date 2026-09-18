@@ -1,0 +1,36 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "types": ["node"],
+
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "exactOptionalPropertyTypes": false,
+    "noFallthroughCasesInSwitch": true,
+    "forceConsistentCasingInFileNames": true,
+
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+
+    // TypeScript 7 removed baseUrl; path targets are relative to this file.
+    "paths": {
+      "@qsynth/core": ["./packages/qsynth-core/src/index.ts"],
+      "@qsynth/core/*": ["./packages/qsynth-core/src/*"]
+    }
+  },
+  "include": [
+    "packages/*/src/**/*.ts",
+    "packages/*/test/**/*.ts",
+    "functions/*/src/**/*.ts",
+    "scripts/**/*.mjs",
+    "test/**/*.ts"
+  ],
+  "exclude": ["node_modules", "site/app", "**/dist"]
+}
