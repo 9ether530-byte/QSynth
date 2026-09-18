@@ -92,7 +92,10 @@ async function issueSession(userId: string, ip: string | null, userAgent: string
 }
 
 async function register(ctx: PublicCtx) {
-  await throttle(`register:${ctx.ip ?? 'unknown'}`, 10);
+  // Generous per-IP ceiling. A tighter limit would block an office behind one NAT and
+  // a CI suite creating fixtures, while doing little against an attacker with a
+  // proxy pool — the thing this actually stops is single-host bulk signup.
+  await throttle(`register:${ctx.ip ?? 'unknown'}`, 60, 3600);
 
   const email = requireEmail(ctx.body);
   const password = requirePassword(ctx.body);

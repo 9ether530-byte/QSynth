@@ -518,7 +518,7 @@ async function issueSession(userId, ip, userAgent) {
   return { token, expiresAt: expiresAt.toISOString() };
 }
 async function register(ctx) {
-  await throttle(`register:${ctx.ip ?? "unknown"}`, 10);
+  await throttle(`register:${ctx.ip ?? "unknown"}`, 60, 3600);
   const email = requireEmail(ctx.body);
   const password = requirePassword(ctx.body);
   const name = requireString(ctx.body, "name", { max: 120 });
