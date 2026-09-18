@@ -20,7 +20,9 @@ var STATUS = {
   COMPILE_FAILED: 422,
   PARSE_ERROR: 422,
   UNSUPPORTED_CONSTRUCT: 422,
+  INVALID_SPEC: 422,
   BUDGET_EXCEEDED: 422,
+  VERIFICATION_FAILED: 422,
   INTERNAL: 500
 };
 var ApiError = class extends Error {
@@ -68,11 +70,11 @@ function getPool() {
 }
 var savepointSeq = 0;
 async function withTx(ctx, fn) {
-  const client = await getPool().connect();
+  const client2 = await getPool().connect();
   try {
-    await client.query("begin");
-    await client.query("set local role qsynth_app");
-    await client.query("select set_config($1, $2, true), set_config($3, $4, true)", [
+    await client2.query("begin");
+    await client2.query("set local role qsynth_app");
+    await client2.query("select set_config($1, $2, true), set_config($3, $4, true)", [
       "app.current_org",
       ctx.orgId ?? "",
       "app.current_user",
@@ -80,37 +82,37 @@ async function withTx(ctx, fn) {
     ]);
     const tx = {
       async query(sql, params) {
-        const r = await client.query(sql, params);
+        const r = await client2.query(sql, params);
         return r.rows;
       },
       async one(sql, params) {
-        const r = await client.query(sql, params);
+        const r = await client2.query(sql, params);
         return r.rows[0];
       },
       async savepoint(inner) {
         const name = `sp_${++savepointSeq}`;
-        await client.query(`savepoint ${name}`);
+        await client2.query(`savepoint ${name}`);
         try {
           const result2 = await inner();
-          await client.query(`release savepoint ${name}`);
+          await client2.query(`release savepoint ${name}`);
           return result2;
         } catch (err) {
-          await client.query(`rollback to savepoint ${name}`);
+          await client2.query(`rollback to savepoint ${name}`);
           throw err;
         }
       }
     };
     const result = await fn(tx);
-    await client.query("commit");
+    await client2.query("commit");
     return result;
   } catch (err) {
     try {
-      await client.query("rollback");
+      await client2.query("rollback");
     } catch {
     }
     throw err;
   } finally {
-    client.release();
+    client2.release();
   }
 }
 var withAuthTx = (fn) => withTx({ orgId: null, userId: null }, fn);
@@ -1127,11 +1129,2489 @@ var auditRoutes = [
   { method: "GET", path: "/v1/audit-logs", auth: "audit:read", handler: list4 }
 ];
 
+// packages/qsynth-core/src/version.ts
+var COMPILER_VERSION = "1.0.0";
+
+// packages/qsynth-core/src/errors.ts
+var QsynthError = class extends Error {
+  code;
+  hint;
+  span;
+  details;
+  constructor(code, message, hint, options = {}) {
+    super(message);
+    this.name = "QsynthError";
+    this.code = code;
+    this.hint = hint;
+    this.span = options.span;
+    this.details = options.details ?? {};
+  }
+  toJSON() {
+    return {
+      code: this.code,
+      message: this.message,
+      hint: this.hint,
+      ...this.span ? { span: this.span } : {},
+      ...Object.keys(this.details).length ? { details: this.details } : {}
+    };
+  }
+};
+var parseError = (message, hint, span) => new QsynthError("PARSE_ERROR", message, hint, { span });
+var invalidSpec = (message, hint, details = {}) => new QsynthError("INVALID_SPEC", message, hint, { details });
+function assertInvariant(condition, what) {
+  if (!condition) {
+    throw new QsynthError(
+      "INTERNAL",
+      `Compiler invariant violated: ${what}.`,
+      "This is a bug in QSYNTH. Please report the specification that produced it.",
+      { details: { invariant: what } }
+    );
+  }
+}
+
+// packages/qsynth-core/src/hash.ts
+import { createHash as createHash2 } from "node:crypto";
+function canonicalize(value) {
+  if (value === null) return "null";
+  switch (typeof value) {
+    case "boolean":
+      return value ? "true" : "false";
+    case "number":
+      assertInvariant(Number.isFinite(value), `non-finite number in canonical form (${String(value)})`);
+      return Object.is(value, -0) ? "0" : String(value);
+    case "bigint":
+      return `${value}n`;
+    case "string":
+      return JSON.stringify(value);
+    case "undefined":
+      return "null";
+    default:
+      break;
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalize).join(",")}]`;
+  }
+  if (value instanceof Uint8Array) {
+    return `"u8:${Buffer.from(value).toString("base64")}"`;
+  }
+  const entries = Object.entries(value).filter(([, v]) => v !== void 0).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
+  return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalize(v)}`).join(",")}}`;
+}
+function sha256Hex(input) {
+  return createHash2("sha256").update(input).digest("hex");
+}
+function contentHash(value) {
+  return sha256Hex(canonicalize(value));
+}
+
+// packages/qsynth-core/src/ir/classical.ts
+var ARITY = {
+  const: 0,
+  input: 0,
+  not: 1,
+  and: 2,
+  or: 2,
+  xor: 2,
+  nand: 2,
+  nor: 2,
+  xnor: 2,
+  mux: 3
+};
+var MAX_INPUTS = 20;
+var EXHAUSTIVE_INPUT_LIMIT = 12;
+var ModuleBuilder = class {
+  constructor(name) {
+    this.name = name;
+  }
+  name;
+  nodes = [];
+  inputs = [];
+  outputs = [];
+  assertions = [];
+  dontCare = [];
+  input(name, span) {
+    if (this.inputs.length >= MAX_INPUTS) {
+      throw invalidSpec(
+        `A specification may declare at most ${MAX_INPUTS} input bits; this one declares more.`,
+        "Split the design into smaller modules, or reduce the input width.",
+        { limit: MAX_INPUTS }
+      );
+    }
+    const id = this.nodes.length;
+    this.nodes.push({ id, op: "input", args: [], name, span });
+    this.inputs.push({ id, name });
+    return id;
+  }
+  constant(value, span) {
+    const id = this.nodes.length;
+    this.nodes.push({ id, op: "const", args: [], value, span });
+    return id;
+  }
+  op(op, args, span, name) {
+    assertInvariant(op !== "input" && op !== "const", `op() called with ${op}`);
+    assertInvariant(args.length === ARITY[op], `${op} takes ${ARITY[op]} operands, got ${args.length}`);
+    const id = this.nodes.length;
+    for (const arg of args) assertInvariant(arg >= 0 && arg < id, `operand ${arg} is not defined before node ${id}`);
+    this.nodes.push({ id, op, args: [...args], span, name });
+    return id;
+  }
+  output(name, node, span) {
+    if (this.outputs.some((o) => o.name === name)) {
+      throw invalidSpec(`Output "${name}" is defined more than once.`, "Rename one of the definitions.", { name });
+    }
+    this.outputs.push({ name, node, span });
+  }
+  assertion(name, node, span) {
+    this.assertions.push({ name, node, span });
+  }
+  markDontCare(assignments) {
+    this.dontCare.push(...assignments);
+  }
+  build() {
+    if (this.inputs.length === 0) {
+      throw invalidSpec(
+        "The specification declares no inputs.",
+        "A circuit with no inputs is a constant; declare at least one input bit."
+      );
+    }
+    if (this.outputs.length === 0) {
+      throw invalidSpec(
+        "The specification defines no outputs.",
+        "Assign at least one output, for example: out = a AND b"
+      );
+    }
+    return {
+      name: this.name,
+      inputs: [...this.inputs],
+      nodes: [...this.nodes],
+      outputs: [...this.outputs],
+      assertions: [...this.assertions],
+      dontCare: [...new Set(this.dontCare)].sort((a, b) => a - b)
+    };
+  }
+};
+function liveNodes(module) {
+  const live = /* @__PURE__ */ new Set();
+  const stack = [...module.outputs.map((o) => o.node), ...module.assertions.map((a) => a.node)];
+  while (stack.length > 0) {
+    const id = stack.pop();
+    if (live.has(id)) continue;
+    live.add(id);
+    const node = module.nodes[id];
+    assertInvariant(node !== void 0, `node ${id} referenced but not defined`);
+    stack.push(...node.args);
+  }
+  return live;
+}
+
+// packages/qsynth-core/src/ir/reversible.ts
+var GATE_ARITY = { x: 1, cnot: 2, ccnot: 3, cswap: 3 };
+var MULTI_QUBIT = /* @__PURE__ */ new Set(["cnot", "ccnot", "cswap"]);
+var CircuitBuilder = class {
+  constructor(name) {
+    this.name = name;
+  }
+  name;
+  wires = [];
+  gates = [];
+  inputs = [];
+  outputs = [];
+  ancillas = [];
+  get gateCount() {
+    return this.gates.length;
+  }
+  get wireCount() {
+    return this.wires.length;
+  }
+  addInput(name) {
+    const index = this.wires.length;
+    this.wires.push({ index, role: "input", name });
+    this.inputs.push({ name, wire: index });
+    return index;
+  }
+  addOutput(name) {
+    const index = this.wires.length;
+    this.wires.push({ index, role: "output", name });
+    this.outputs.push({ name, wire: index });
+    return index;
+  }
+  allocateAncilla(purpose, nodeId, span) {
+    const index = this.wires.length;
+    this.wires.push({ index, role: "ancilla", name: `anc${this.ancillas.length}` });
+    const record = {
+      wire: index,
+      purpose,
+      nodeId,
+      allocatedAtGate: this.gates.length,
+      uncomputedAtGate: null,
+      releasedAtGate: null,
+      span
+    };
+    this.ancillas.push(record);
+    return record;
+  }
+  emit(kind, wires, opts = {}) {
+    assertInvariant(wires.length === GATE_ARITY[kind], `${kind} takes ${GATE_ARITY[kind]} wires, got ${wires.length}`);
+    assertInvariant(new Set(wires).size === wires.length, `${kind} names the same wire twice`);
+    for (const w of wires) assertInvariant(w >= 0 && w < this.wires.length, `gate references undeclared wire ${w}`);
+    const index = this.gates.length;
+    this.gates.push({ kind, wires: [...wires], span: opts.span, nodeId: opts.nodeId });
+    return index;
+  }
+  /** Appends the inverse of gates `[from, to)` — the same gates in reverse order. */
+  emitInverseOf(from, to) {
+    for (let i = to - 1; i >= from; i--) {
+      const gate = this.gates[i];
+      this.gates.push({ kind: gate.kind, wires: gate.wires, span: gate.span, nodeId: gate.nodeId });
+    }
+  }
+  build() {
+    return {
+      name: this.name,
+      wires: [...this.wires],
+      gates: [...this.gates],
+      inputs: [...this.inputs],
+      outputs: [...this.outputs],
+      ancillas: this.ancillas.map((a) => ({ ...a }))
+    };
+  }
+};
+function targetsOf(gate) {
+  return gate.kind === "cswap" ? gate.wires.slice(1) : gate.wires.slice(-1);
+}
+function invert(circuit) {
+  return { ...circuit, gates: [...circuit.gates].reverse() };
+}
+function depth(circuit) {
+  const ready = new Int32Array(circuit.wires.length);
+  let maximum = 0;
+  for (const gate of circuit.gates) {
+    let layer = 0;
+    for (const w of gate.wires) layer = Math.max(layer, ready[w]);
+    const next = layer + 1;
+    for (const w of gate.wires) ready[w] = next;
+    if (next > maximum) maximum = next;
+  }
+  return maximum;
+}
+
+// packages/qsynth-core/src/eval/classical.ts
+function assignmentToBits(assignment, inputCount) {
+  const bits = [];
+  for (let i = 0; i < inputCount; i++) bits.push(assignment >> i & 1);
+  return bits;
+}
+function evaluateNodes(module, inputBits) {
+  assertInvariant(inputBits.length === module.inputs.length, "input width mismatch in evaluateNodes");
+  const values = new Uint8Array(module.nodes.length);
+  let inputIndex = 0;
+  for (const node of module.nodes) {
+    const a = () => values[node.args[0]];
+    const b = () => values[node.args[1]];
+    const c = () => values[node.args[2]];
+    switch (node.op) {
+      case "input":
+        values[node.id] = inputBits[inputIndex++];
+        break;
+      case "const":
+        values[node.id] = node.value ?? 0;
+        break;
+      case "not":
+        values[node.id] = a() ^ 1;
+        break;
+      case "and":
+        values[node.id] = a() & b();
+        break;
+      case "or":
+        values[node.id] = a() | b();
+        break;
+      case "xor":
+        values[node.id] = a() ^ b();
+        break;
+      case "nand":
+        values[node.id] = a() & b() ^ 1;
+        break;
+      case "nor":
+        values[node.id] = (a() | b()) ^ 1;
+        break;
+      case "xnor":
+        values[node.id] = a() ^ b() ^ 1;
+        break;
+      case "mux":
+        values[node.id] = a() === 1 ? b() : c();
+        break;
+    }
+  }
+  return values;
+}
+function evaluate(module, inputBits) {
+  const values = evaluateNodes(module, inputBits);
+  const outputs = {};
+  for (const binding of module.outputs) outputs[binding.name] = values[binding.node];
+  const assertions = {};
+  for (const binding of module.assertions) assertions[binding.name] = values[binding.node];
+  return { outputs, assertions };
+}
+
+// packages/qsynth-core/src/trace/trace.ts
+var TraceRecorder = class {
+  entries = [];
+  add(entry) {
+    this.entries.push({ seq: this.entries.length, ...entry });
+  }
+  get length() {
+    return this.entries.length;
+  }
+  toArray() {
+    return this.entries;
+  }
+  /** Entries touching a given wire — the workbench uses this for hover-linking. */
+  forWire(wire) {
+    return this.entries.filter((e) => e.wires?.includes(wire));
+  }
+};
+
+// packages/qsynth-core/src/frontend/boolean/lexer.ts
+var KEYWORDS = /* @__PURE__ */ new Set(["IN", "LET", "ASSERT"]);
+var WORD_OPERATORS = /* @__PURE__ */ new Set(["AND", "OR", "XOR", "NAND", "NOR", "XNOR", "NOT", "MUX"]);
+var SYMBOL_OPERATORS = {
+  "&": "AND",
+  "&&": "AND",
+  "|": "OR",
+  "||": "OR",
+  "^": "XOR",
+  "!": "NOT",
+  "~": "NOT"
+};
+var MAX_SOURCE_BYTES = 64 * 1024;
+function tokenize(source) {
+  if (source.length > MAX_SOURCE_BYTES) {
+    throw new QsynthError(
+      "SPEC_TOO_LARGE",
+      `The specification is ${source.length} characters long; the limit is ${MAX_SOURCE_BYTES}.`,
+      "Split the design into smaller modules.",
+      { details: { length: source.length, limit: MAX_SOURCE_BYTES } }
+    );
+  }
+  const tokens = [];
+  let index = 0;
+  let line = 1;
+  let column = 1;
+  const at = () => source[index];
+  const span = (start, startLine, startColumn) => ({
+    start,
+    end: index,
+    line: startLine,
+    column: startColumn
+  });
+  const push = (kind, value, start, startLine, startColumn) => {
+    tokens.push({ kind, value, span: span(start, startLine, startColumn) });
+  };
+  const advance = (count = 1) => {
+    for (let i = 0; i < count; i++) {
+      if (source[index] === "\n") {
+        line++;
+        column = 1;
+      } else {
+        column++;
+      }
+      index++;
+    }
+  };
+  while (index < source.length) {
+    const start = index;
+    const startLine = line;
+    const startColumn = column;
+    const ch = at();
+    if (ch === "\n") {
+      advance();
+      push("newline", "\\n", start, startLine, startColumn);
+      continue;
+    }
+    if (ch === " " || ch === "	" || ch === "\r") {
+      advance();
+      continue;
+    }
+    if (ch === "#") {
+      while (index < source.length && at() !== "\n") advance();
+      continue;
+    }
+    if (isIdentStart(ch)) {
+      while (index < source.length && isIdentPart(at())) advance();
+      const text = source.slice(start, index);
+      const upper = text.toUpperCase();
+      if (KEYWORDS.has(upper)) push("keyword", upper, start, startLine, startColumn);
+      else if (WORD_OPERATORS.has(upper)) push("operator", upper, start, startLine, startColumn);
+      else push("ident", text, start, startLine, startColumn);
+      continue;
+    }
+    if (ch >= "0" && ch <= "9") {
+      while (index < source.length && at() >= "0" && at() <= "9") advance();
+      const text = source.slice(start, index);
+      if (text !== "0" && text !== "1") {
+        throw parseError(
+          `"${text}" is not a bit literal.`,
+          "Only the literals 0 and 1 exist in a Boolean specification.",
+          span(start, startLine, startColumn)
+        );
+      }
+      push("number", text, start, startLine, startColumn);
+      continue;
+    }
+    const two = source.slice(index, index + 2);
+    if (SYMBOL_OPERATORS[two]) {
+      advance(2);
+      push("operator", SYMBOL_OPERATORS[two], start, startLine, startColumn);
+      continue;
+    }
+    if (SYMBOL_OPERATORS[ch]) {
+      advance();
+      push("operator", SYMBOL_OPERATORS[ch], start, startLine, startColumn);
+      continue;
+    }
+    const punctuation = {
+      "(": "lparen",
+      ")": "rparen",
+      ",": "comma",
+      ":": "colon",
+      "=": "equals"
+    };
+    const kind = punctuation[ch];
+    if (kind) {
+      advance();
+      push(kind, ch, start, startLine, startColumn);
+      continue;
+    }
+    advance();
+    throw parseError(
+      `Unexpected character "${ch}".`,
+      "Boolean specifications use identifiers, the literals 0 and 1, the operators AND OR XOR NAND NOR XNOR NOT (or & | ^ !), MUX, parentheses and commas.",
+      span(start, startLine, startColumn)
+    );
+  }
+  tokens.push({ kind: "eof", value: "", span: { start: index, end: index, line, column } });
+  return tokens;
+}
+function isIdentStart(ch) {
+  return ch >= "a" && ch <= "z" || ch >= "A" && ch <= "Z" || ch === "_";
+}
+function isIdentPart(ch) {
+  return isIdentStart(ch) || ch >= "0" && ch <= "9";
+}
+
+// packages/qsynth-core/src/frontend/boolean/parser.ts
+var LEVELS = [
+  ["OR", "NOR"],
+  ["XOR", "XNOR"],
+  ["AND", "NAND"]
+];
+function parseBoolean(source) {
+  const tokens = tokenize(source);
+  let position = 0;
+  let assertionCount = 0;
+  const peek = () => tokens[position];
+  const next = () => tokens[position++];
+  const at = (kind, value) => {
+    const token = peek();
+    return token.kind === kind && (value === void 0 || token.value === value);
+  };
+  const expect = (kind, description) => {
+    if (!at(kind)) {
+      throw parseError(
+        `Expected ${description}, found ${describe(peek())}.`,
+        'A statement is one of: "in a, b", "let t = expr", "assert expr", or "name = expr".',
+        peek().span
+      );
+    }
+    return next();
+  };
+  const skipNewlines = () => {
+    while (at("newline")) next();
+  };
+  const statements = [];
+  skipNewlines();
+  while (!at("eof")) {
+    statements.push(parseStatement());
+    if (!at("eof")) {
+      if (!at("newline")) {
+        throw parseError(
+          `Expected the end of the line, found ${describe(peek())}.`,
+          "Each statement occupies one line.",
+          peek().span
+        );
+      }
+      skipNewlines();
+    }
+  }
+  if (statements.length === 0) {
+    throw parseError("The specification is empty.", "Write at least one output, for example: out = a AND b");
+  }
+  return { statements };
+  function parseStatement() {
+    const start = peek().span;
+    if (at("keyword", "IN")) {
+      next();
+      const names = [];
+      for (; ; ) {
+        const token = expect("ident", "an input name");
+        names.push({ name: token.value, span: token.span });
+        if (at("comma")) {
+          next();
+          continue;
+        }
+        break;
+      }
+      return { kind: "inputs", names, span: join(start, names[names.length - 1].span) };
+    }
+    if (at("keyword", "LET")) {
+      next();
+      const name2 = expect("ident", "a name for the value");
+      expect("equals", '"="');
+      const expr2 = parseExpr(0);
+      return { kind: "let", name: name2.value, expr: expr2, span: join(start, expr2.span) };
+    }
+    if (at("keyword", "ASSERT")) {
+      next();
+      let name2 = `assertion_${++assertionCount}`;
+      if (at("ident") && tokens[position + 1]?.kind === "colon") {
+        name2 = next().value;
+        next();
+      }
+      const expr2 = parseExpr(0);
+      return { kind: "assert", name: name2, expr: expr2, span: join(start, expr2.span) };
+    }
+    const name = expect("ident", "an output name");
+    expect("equals", '"="');
+    const expr = parseExpr(0);
+    return { kind: "output", name: name.value, expr, span: join(start, expr.span) };
+  }
+  function parseExpr(level) {
+    if (level >= LEVELS.length) return parseUnary();
+    let left = parseExpr(level + 1);
+    for (; ; ) {
+      const token = peek();
+      if (token.kind !== "operator" || !LEVELS[level].includes(token.value)) return left;
+      next();
+      const right = parseExpr(level + 1);
+      left = { kind: "binary", op: token.value, left, right, span: join(left.span, right.span) };
+    }
+  }
+  function parseUnary() {
+    if (at("operator", "NOT")) {
+      const start = next().span;
+      const operand = parseUnary();
+      return { kind: "not", operand, span: join(start, operand.span) };
+    }
+    return parsePrimary();
+  }
+  function parsePrimary() {
+    const token = peek();
+    if (token.kind === "ident") {
+      next();
+      return { kind: "ref", name: token.value, span: token.span };
+    }
+    if (token.kind === "number") {
+      next();
+      return { kind: "const", value: token.value === "1" ? 1 : 0, span: token.span };
+    }
+    if (token.kind === "lparen") {
+      next();
+      const inner = parseExpr(0);
+      const close = expect("rparen", '")"');
+      return { ...inner, span: join(token.span, close.span) };
+    }
+    if (token.kind === "operator" && token.value === "MUX") {
+      next();
+      expect("lparen", '"(" after MUX');
+      const selector = parseExpr(0);
+      expect("comma", '"," after the MUX selector');
+      const ifOne = parseExpr(0);
+      expect("comma", '"," after the MUX value for 1');
+      const ifZero = parseExpr(0);
+      const close = expect("rparen", '")" closing MUX');
+      return { kind: "mux", selector, ifOne, ifZero, span: join(token.span, close.span) };
+    }
+    throw parseError(
+      `Expected a value, found ${describe(token)}.`,
+      "A value is a name, the literal 0 or 1, a parenthesised expression, or MUX(selector, if-one, if-zero).",
+      token.span
+    );
+  }
+}
+function join(a, b) {
+  return { start: a.start, end: b.end, line: a.line, column: a.column };
+}
+function describe(token) {
+  switch (token.kind) {
+    case "eof":
+      return "the end of the specification";
+    case "newline":
+      return "the end of the line";
+    default:
+      return `"${token.value}"`;
+  }
+}
+
+// packages/qsynth-core/src/frontend/boolean/lower.ts
+function lowerBoolean(source, options = {}) {
+  const program = parseBoolean(source);
+  return lowerProgram(program.statements, options);
+}
+function lowerProgram(statements, options) {
+  const builder = new ModuleBuilder(options.moduleName ?? "module");
+  const trace = options.trace;
+  const scope = /* @__PURE__ */ new Map();
+  const inputs = /* @__PURE__ */ new Set();
+  const explicitInputs = statements.some((s) => s.kind === "inputs");
+  const resolve = (name, span) => {
+    const existing = scope.get(name);
+    if (existing !== void 0) return existing;
+    if (explicitInputs) {
+      throw parseError(
+        `"${name}" is not defined.`,
+        suggest(name, [...scope.keys()]) ?? 'Declare it as an input with an "in" line, or define it with "let" before using it.',
+        span
+      );
+    }
+    const id = builder.input(name, span);
+    scope.set(name, id);
+    inputs.add(name);
+    trace?.add({
+      phase: "parse",
+      kind: "input.implicit",
+      message: `"${name}" is never assigned, so it is treated as an input bit.`,
+      nodeId: id,
+      span
+    });
+    return id;
+  };
+  const build = (expr, label) => {
+    switch (expr.kind) {
+      case "ref":
+        return resolve(expr.name, expr.span);
+      case "const":
+        return builder.constant(expr.value, expr.span);
+      case "not":
+        return builder.op("not", [build(expr.operand)], expr.span, label);
+      case "binary": {
+        const left = build(expr.left);
+        const right = build(expr.right);
+        return builder.op(expr.op.toLowerCase(), [left, right], expr.span, label);
+      }
+      case "mux": {
+        const selector = build(expr.selector);
+        const ifOne = build(expr.ifOne);
+        const ifZero = build(expr.ifZero);
+        return builder.op("mux", [selector, ifOne, ifZero], expr.span, label);
+      }
+    }
+  };
+  const claim = (name, span, what) => {
+    if (scope.has(name)) {
+      throw parseError(
+        `"${name}" is already defined.`,
+        inputs.has(name) ? "Input names cannot be reassigned." : `Choose a different name for this ${what}.`,
+        span
+      );
+    }
+  };
+  for (const statement of statements) {
+    switch (statement.kind) {
+      case "inputs":
+        for (const { name, span } of statement.names) {
+          claim(name, span, "input");
+          const id = builder.input(name, span);
+          scope.set(name, id);
+          inputs.add(name);
+          trace?.add({
+            phase: "parse",
+            kind: "input.declared",
+            message: `"${name}" is declared as an input bit.`,
+            nodeId: id,
+            span
+          });
+        }
+        break;
+      case "let": {
+        claim(statement.name, statement.span, "value");
+        const id = build(statement.expr, statement.name);
+        scope.set(statement.name, id);
+        trace?.add({
+          phase: "parse",
+          kind: "let.bind",
+          message: `"${statement.name}" names an intermediate value; it is not exported as an output.`,
+          nodeId: id,
+          span: statement.span
+        });
+        break;
+      }
+      case "output": {
+        claim(statement.name, statement.span, "output");
+        const id = build(statement.expr, statement.name);
+        scope.set(statement.name, id);
+        builder.output(statement.name, id, statement.span);
+        trace?.add({
+          phase: "parse",
+          kind: "output.bind",
+          message: `"${statement.name}" is an output of the module.`,
+          nodeId: id,
+          span: statement.span
+        });
+        break;
+      }
+      case "assert": {
+        const id = build(statement.expr, statement.name);
+        builder.assertion(statement.name, id, statement.span);
+        trace?.add({
+          phase: "parse",
+          kind: "assertion.bind",
+          message: `Invariant "${statement.name}" must hold for every input assignment; it is checked, not synthesised into an output.`,
+          nodeId: id,
+          span: statement.span
+        });
+        break;
+      }
+    }
+  }
+  return builder.build();
+}
+function suggest(name, candidates) {
+  let best;
+  for (const candidate of candidates) {
+    const distance = editDistance(name.toLowerCase(), candidate.toLowerCase());
+    const allowed = candidate.length <= 4 ? 1 : 2;
+    if (distance <= allowed && (!best || distance < best.distance)) best = { name: candidate, distance };
+  }
+  return best ? `Did you mean "${best.name}"?` : void 0;
+}
+function editDistance(a, b) {
+  const rows = [];
+  for (let i = 0; i <= a.length; i++) rows.push(new Array(b.length + 1).fill(0));
+  for (let i = 0; i <= a.length; i++) rows[i][0] = i;
+  for (let j = 0; j <= b.length; j++) rows[0][j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      let value = Math.min(rows[i - 1][j] + 1, rows[i][j - 1] + 1, rows[i - 1][j - 1] + cost);
+      if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) {
+        value = Math.min(value, rows[i - 2][j - 2] + 1);
+      }
+      rows[i][j] = value;
+    }
+  }
+  return rows[a.length][b.length];
+}
+
+// packages/qsynth-core/src/frontend/truthtable/parser.ts
+function parseTruthTable(source) {
+  if (source.length > MAX_SOURCE_BYTES) {
+    throw new QsynthError(
+      "SPEC_TOO_LARGE",
+      `The table is ${source.length} characters long; the limit is ${MAX_SOURCE_BYTES}.`,
+      "Split the design into smaller tables.",
+      { details: { length: source.length, limit: MAX_SOURCE_BYTES } }
+    );
+  }
+  const lines = splitLines(source);
+  const content = lines.filter((line) => line.text.trim().length > 0);
+  if (content.length === 0) {
+    throw parseError("The table is empty.", "Start with a header line, for example: a b | out");
+  }
+  const header = parseHeader(content[0]);
+  if (header.inputs.length > EXHAUSTIVE_INPUT_LIMIT) {
+    throw invalidSpec(
+      `A truth table may declare at most ${EXHAUSTIVE_INPUT_LIMIT} inputs; this one declares ${header.inputs.length}.`,
+      `A table with ${header.inputs.length} inputs has ${2 ** header.inputs.length} rows. Above ${EXHAUSTIVE_INPUT_LIMIT} inputs, describe the circuit as a Boolean expression instead.`,
+      { limit: EXHAUSTIVE_INPUT_LIMIT, declared: header.inputs.length }
+    );
+  }
+  const rows = [];
+  const seen = /* @__PURE__ */ new Map();
+  for (const line of content.slice(1)) {
+    const { left, right } = splitSides(line);
+    const inputCells = parseCells(left, line.span, header.inputs.length, "input");
+    const outputCells = parseCells(right, line.span, header.outputs.length, "output");
+    for (let i = 0; i < inputCells.length; i++) {
+      if (inputCells[i] === null) {
+        throw parseError(
+          `Input "${header.inputs[i]}" is "-" on this row.`,
+          "Don't-care applies to outputs only. Leave the whole row out instead, or write both 0 and 1 rows.",
+          line.span
+        );
+      }
+    }
+    const inputBits = inputCells;
+    let assignment = 0;
+    for (let i = 0; i < inputBits.length; i++) if (inputBits[i] === 1) assignment += 2 ** i;
+    const previous = seen.get(assignment);
+    if (previous) {
+      throw parseError(
+        `The input combination ${inputBits.join("")} appears twice (first on line ${previous.line}).`,
+        "Each input combination may be listed at most once.",
+        line.span
+      );
+    }
+    seen.set(assignment, line.span);
+    rows.push({ assignment, inputBits, outputs: outputCells, span: line.span });
+  }
+  if (rows.length === 0) {
+    throw parseError(
+      "The table has a header but no rows.",
+      "Add one row per input combination, for example: 0 1 | 1"
+    );
+  }
+  const dontCare = [];
+  const space = 2 ** header.inputs.length;
+  for (let assignment = 0; assignment < space; assignment++) {
+    const row = rows.find((r) => r.assignment === assignment);
+    if (!row || row.outputs.includes(null)) dontCare.push(assignment);
+  }
+  return { inputs: header.inputs, outputs: header.outputs, rows, dontCare };
+}
+function splitLines(source) {
+  const lines = [];
+  let offset = 0;
+  let lineNumber = 1;
+  for (const raw of source.split("\n")) {
+    const withoutComment = raw.split("#")[0];
+    lines.push({
+      text: withoutComment,
+      span: { start: offset, end: offset + withoutComment.length, line: lineNumber, column: 1 }
+    });
+    offset += raw.length + 1;
+    lineNumber++;
+  }
+  return lines;
+}
+function splitSides(line) {
+  const separator = line.text.includes("|") ? "|" : line.text.includes("->") ? "->" : null;
+  if (separator === null) {
+    throw parseError(
+      "This line has no separator between the input and output columns.",
+      'Separate them with "|" or "->", for example: 0 1 | 1',
+      line.span
+    );
+  }
+  const index = line.text.indexOf(separator);
+  return { left: line.text.slice(0, index), right: line.text.slice(index + separator.length) };
+}
+function parseHeader(line) {
+  const { left, right } = splitSides(line);
+  const inputs = splitNames(left, line.span, "input");
+  const outputs = splitNames(right, line.span, "output");
+  const duplicate = [...inputs, ...outputs].find((name, i, all) => all.indexOf(name) !== i);
+  if (duplicate) {
+    throw parseError(`"${duplicate}" is used as a column name twice.`, "Column names must be unique.", line.span);
+  }
+  return { inputs, outputs };
+}
+function splitNames(text, span, role) {
+  const names = text.split(/[\s,]+/).map((n) => n.trim()).filter((n) => n.length > 0);
+  if (names.length === 0) {
+    throw parseError(`The header declares no ${role} columns.`, "The header looks like: a b | sum carry", span);
+  }
+  for (const name of names) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+      throw parseError(
+        `"${name}" is not a valid ${role} name.`,
+        "Names start with a letter or underscore and contain letters, digits and underscores.",
+        span
+      );
+    }
+  }
+  return names;
+}
+function parseCells(text, span, expected, role) {
+  const cells = [];
+  for (const ch of text) {
+    if (ch === " " || ch === "	" || ch === "\r" || ch === ",") continue;
+    if (ch === "0") cells.push(0);
+    else if (ch === "1") cells.push(1);
+    else if (ch === "-" || ch === "x" || ch === "X") cells.push(null);
+    else {
+      throw parseError(
+        `"${ch}" is not a valid ${role} cell.`,
+        "Cells are 0, 1, or - for a don't-care output.",
+        span
+      );
+    }
+  }
+  if (cells.length !== expected) {
+    throw parseError(
+      `This row has ${cells.length} ${role} cell(s); the header declares ${expected}.`,
+      "Every row needs one cell per declared column.",
+      span
+    );
+  }
+  return cells;
+}
+
+// packages/qsynth-core/src/frontend/truthtable/lower.ts
+function lowerTruthTable(source, options = {}) {
+  return lowerTable(parseTruthTable(source), options);
+}
+function lowerTable(table, options = {}) {
+  const builder = new ModuleBuilder(options.moduleName ?? "module");
+  const trace = options.trace;
+  const inputCount = table.inputs.length;
+  const space = 2 ** inputCount;
+  const inputNodes = table.inputs.map((name) => builder.input(name));
+  trace?.add({
+    phase: "parse",
+    kind: "table.read",
+    message: `The table declares ${inputCount} input(s) and ${table.outputs.length} output(s), and specifies ${table.rows.length} of ${space} possible input combination(s).`,
+    detail: { inputs: table.inputs, outputs: table.outputs, rows: table.rows.length, space }
+  });
+  if (table.dontCare.length > 0) {
+    trace?.add({
+      phase: "parse",
+      kind: "table.dontcare",
+      message: `${table.dontCare.length} input combination(s) are unconstrained \u2014 either omitted from the table or marked "-". The compiler is free to produce any value there, and equivalence is not checked on them.`,
+      detail: { assignments: table.dontCare.slice(0, 64), total: table.dontCare.length }
+    });
+    builder.markDontCare(table.dontCare);
+  }
+  const byAssignment = new Map(table.rows.map((row) => [row.assignment, row.outputs]));
+  const memo = /* @__PURE__ */ new Map();
+  let nodesCreated = 0;
+  let memoHits = 0;
+  const build = (level, pattern) => {
+    const key = `${level}:${pattern}`;
+    const cached = memo.get(key);
+    if (cached !== void 0) {
+      memoHits++;
+      return cached;
+    }
+    let id;
+    if (!pattern.includes("1")) {
+      id = builder.constant(0);
+      nodesCreated++;
+    } else if (!pattern.includes("0")) {
+      id = builder.constant(1);
+      nodesCreated++;
+    } else {
+      assertInvariant(level > 0, "a single-cell pattern must be constant");
+      const half = pattern.length >> 1;
+      const low = pattern.slice(0, half);
+      const high = pattern.slice(half);
+      if (low === high) {
+        id = build(level - 1, low);
+      } else {
+        const selector = inputNodes[level - 1];
+        id = builder.op("mux", [selector, build(level - 1, high), build(level - 1, low)]);
+        nodesCreated++;
+      }
+    }
+    memo.set(key, id);
+    return id;
+  };
+  table.outputs.forEach((name, index) => {
+    let pattern = "";
+    for (let assignment = 0; assignment < space; assignment++) {
+      const cell = byAssignment.get(assignment)?.[index];
+      pattern += cell === 1 ? "1" : cell === 0 ? "0" : "-";
+    }
+    const node = build(inputCount, pattern);
+    builder.output(name, node);
+    trace?.add({
+      phase: "parse",
+      kind: "table.output",
+      message: `Output "${name}" is synthesised from its column by Shannon decomposition on the input bits.`,
+      nodeId: node,
+      detail: { output: name }
+    });
+  });
+  trace?.add({
+    phase: "parse",
+    kind: "table.synthesis",
+    message: `Synthesis produced ${nodesCreated} node(s); ${memoHits} subfunction(s) were shared rather than rebuilt. Sharing is why a structured table does not grow one term per row.`,
+    detail: { nodesCreated, memoHits }
+  });
+  return builder.build();
+}
+
+// packages/qsynth-core/src/lowering/classicalToReversible.ts
+function lowerToReversible(module, trace) {
+  const builder = new CircuitBuilder(module.name);
+  const nodeWire = /* @__PURE__ */ new Map();
+  const live = liveNodes(module);
+  for (const input of module.inputs) {
+    const wire = builder.addInput(input.name);
+    nodeWire.set(input.id, wire);
+    trace.add({
+      phase: "lower",
+      kind: "wire.input",
+      message: `Input "${input.name}" occupies wire ${wire}, and is never written to.`,
+      nodeId: input.id,
+      wires: [wire]
+    });
+  }
+  const computeStart = builder.gateCount;
+  for (const node of module.nodes) {
+    if (node.op === "input") continue;
+    if (!live.has(node.id)) {
+      trace.add({
+        phase: "lower",
+        kind: "node.dead",
+        message: `Node ${node.id} (${node.op}) has no path to any output or assertion, so no wire was allocated for it.`,
+        nodeId: node.id,
+        span: node.span
+      });
+      continue;
+    }
+    lowerNode(module, node, builder, nodeWire, trace);
+  }
+  const computeEnd = builder.gateCount;
+  for (const binding of module.outputs) {
+    const source = nodeWire.get(binding.node);
+    assertInvariant(source !== void 0, `output "${binding.name}" has no computed wire`);
+    const target = builder.addOutput(binding.name);
+    const gateIndex = builder.emit("cnot", [source, target], { span: binding.span, nodeId: binding.node });
+    trace.add({
+      phase: "lower",
+      kind: "output.copy",
+      message: `Output "${binding.name}" is copied onto wire ${target} with a CNOT from wire ${source}.`,
+      nodeId: binding.node,
+      wires: [source, target],
+      gateIndex,
+      span: binding.span
+    });
+  }
+  for (const binding of module.assertions) {
+    const source = nodeWire.get(binding.node);
+    assertInvariant(source !== void 0, `assertion "${binding.name}" has no computed wire`);
+    const target = builder.addOutput(`assert:${binding.name}`);
+    const gateIndex = builder.emit("cnot", [source, target], { span: binding.span, nodeId: binding.node });
+    trace.add({
+      phase: "lower",
+      kind: "assertion.copy",
+      message: `Assertion "${binding.name}" is copied onto wire ${target} so it can be evaluated after the circuit runs.`,
+      nodeId: binding.node,
+      wires: [source, target],
+      gateIndex,
+      span: binding.span
+    });
+  }
+  const uncomputeStart = builder.gateCount;
+  builder.emitInverseOf(computeStart, computeEnd);
+  const uncomputeEnd = builder.gateCount;
+  trace.add({
+    phase: "reversible",
+    kind: "uncompute.block",
+    message: `The ${computeEnd - computeStart} compute gates are replayed in reverse (gates ${uncomputeStart}\u2013${uncomputeEnd - 1}), returning every ancilla to |0\u27E9. Each gate in this IR is its own inverse, so no separate inverse gates are needed.`,
+    detail: { computeStart, computeEnd, uncomputeStart, uncomputeEnd }
+  });
+  const circuit = builder.build();
+  const dirtied = /* @__PURE__ */ new Set();
+  for (let i = computeStart; i < computeEnd; i++) {
+    for (const w of targetsOf(circuit.gates[i])) dirtied.add(w);
+  }
+  for (const record of circuit.ancillas) {
+    const touched = dirtied.has(record.wire);
+    const mirror = touched ? uncomputeStart + (computeEnd - 1 - record.allocatedAtGate) : record.allocatedAtGate;
+    record.uncomputedAtGate = mirror;
+    record.releasedAtGate = uncomputeEnd - 1;
+    trace.add({
+      phase: "reversible",
+      kind: "ancilla.ledger",
+      message: touched ? `Ancilla on wire ${record.wire} (${record.purpose}) is allocated before gate ${record.allocatedAtGate}, uncomputed at gate ${mirror}, and released at the end of the circuit.` : `Ancilla on wire ${record.wire} (${record.purpose}) is never written to \u2014 it holds |0\u27E9 for the whole circuit, so there is nothing to uncompute.`,
+      wires: [record.wire],
+      nodeId: record.nodeId,
+      span: record.span,
+      detail: {
+        allocatedAtGate: record.allocatedAtGate,
+        uncomputedAtGate: mirror,
+        releasedAtGate: record.releasedAtGate
+      }
+    });
+  }
+  return { circuit, nodeWire };
+}
+function lowerNode(module, node, builder, nodeWire, trace) {
+  const operand = (i) => {
+    const wire = nodeWire.get(node.args[i]);
+    assertInvariant(wire !== void 0, `operand ${node.args[i]} of node ${node.id} has no wire`);
+    return wire;
+  };
+  const record = builder.allocateAncilla(describe2(module, node), node.id, node.span);
+  const target = record.wire;
+  const firstGate = builder.gateCount;
+  const emit = (kind, wires) => builder.emit(kind, wires, { span: node.span, nodeId: node.id });
+  const copy = (a) => emit("cnot", [a, target]);
+  const flip = () => emit("x", [target]);
+  const and2 = (a, b) => a === b ? copy(a) : emit("ccnot", [a, b, target]);
+  const xor2 = (a, b) => {
+    if (a === b) return;
+    copy(a);
+    copy(b);
+  };
+  switch (node.op) {
+    case "const":
+      if (node.value === 1) flip();
+      break;
+    case "not":
+      copy(operand(0));
+      flip();
+      break;
+    case "and":
+      and2(operand(0), operand(1));
+      break;
+    case "nand":
+      and2(operand(0), operand(1));
+      flip();
+      break;
+    case "xor":
+      xor2(operand(0), operand(1));
+      break;
+    case "xnor":
+      xor2(operand(0), operand(1));
+      flip();
+      break;
+    case "or":
+      and2(operand(0), operand(1));
+      xor2(operand(0), operand(1));
+      break;
+    case "nor":
+      and2(operand(0), operand(1));
+      xor2(operand(0), operand(1));
+      flip();
+      break;
+    case "mux": {
+      const [s, x, y] = [operand(0), operand(1), operand(2)];
+      copy(y);
+      and2(s, x);
+      and2(s, y);
+      break;
+    }
+    default:
+      assertInvariant(false, `no lowering rule for ${node.op}`);
+  }
+  nodeWire.set(node.id, target);
+  trace.add({
+    phase: "lower",
+    kind: "node.lower",
+    message: `${describe2(module, node)} is computed onto ancilla wire ${target} using ${builder.gateCount - firstGate} gate(s).`,
+    nodeId: node.id,
+    wires: [target, ...node.args.map((a) => nodeWire.get(a))],
+    gateIndex: firstGate,
+    span: node.span,
+    detail: { op: node.op, gates: builder.gateCount - firstGate }
+  });
+}
+function describe2(module, node) {
+  if (node.name) return `"${node.name}" (${node.op})`;
+  const output = module.outputs.find((o) => o.node === node.id);
+  if (output) return `output "${output.name}" (${node.op})`;
+  return `intermediate ${node.op} at node ${node.id}`;
+}
+
+// packages/qsynth-core/src/sim/basisState.ts
+function zeroState(circuit) {
+  return new Uint8Array(circuit.wires.length);
+}
+function initialState(circuit, inputBits) {
+  assertInvariant(
+    inputBits.length === circuit.inputs.length,
+    `circuit has ${circuit.inputs.length} inputs, got ${inputBits.length} bits`
+  );
+  const state = zeroState(circuit);
+  for (let i = 0; i < inputBits.length; i++) state[circuit.inputs[i].wire] = inputBits[i];
+  return state;
+}
+function applyGate(state, gate) {
+  const w = gate.wires;
+  switch (gate.kind) {
+    case "x": {
+      const t = w[0];
+      state[t] = state[t] ^ 1;
+      break;
+    }
+    case "cnot": {
+      const t = w[1];
+      if (state[w[0]] === 1) state[t] = state[t] ^ 1;
+      break;
+    }
+    case "ccnot": {
+      const t = w[2];
+      if (state[w[0]] === 1 && state[w[1]] === 1) state[t] = state[t] ^ 1;
+      break;
+    }
+    case "cswap": {
+      if (state[w[0]] === 1) {
+        const a = w[1];
+        const b = w[2];
+        const tmp = state[a];
+        state[a] = state[b];
+        state[b] = tmp;
+      }
+      break;
+    }
+  }
+}
+function run(circuit, state) {
+  for (const gate of circuit.gates) applyGate(state, gate);
+  return state;
+}
+function simulate(circuit, inputBits) {
+  const state = run(circuit, initialState(circuit, inputBits));
+  return {
+    state,
+    outputs: circuit.outputs.map((o) => state[o.wire]),
+    inputsAtEnd: circuit.inputs.map((i) => state[i.wire]),
+    ancillasAtEnd: circuit.ancillas.map((a) => state[a.wire])
+  };
+}
+
+// packages/qsynth-core/src/estimate/resources.ts
+var GATE_COST = {
+  x: { t: 0, tDepth: 0, cnot: 0, gates: 1 },
+  cnot: { t: 0, tDepth: 0, cnot: 1, gates: 1 },
+  ccnot: { t: 7, tDepth: 3, cnot: 6, gates: 15 },
+  cswap: { t: 7, tDepth: 3, cnot: 8, gates: 17 }
+};
+var BUDGET_FIELDS = [
+  { key: "maxQubits", label: "qubits", actual: (e) => e.qubits, projected: false },
+  { key: "maxGates", label: "reversible gates", actual: (e) => e.gateCount, projected: false },
+  { key: "maxDepth", label: "circuit depth", actual: (e) => e.depth, projected: false },
+  { key: "maxTCount", label: "T count", actual: (e) => e.projected.tCount, projected: true },
+  { key: "maxTDepth", label: "T depth", actual: (e) => e.projected.tDepth, projected: true },
+  {
+    key: "maxTwoQubitGates",
+    label: "two-qubit gates",
+    actual: (e) => e.projected.twoQubitGates,
+    projected: true
+  }
+];
+function estimate(circuit) {
+  const gatesByKind = {};
+  let multiQubitGates = 0;
+  let tCount = 0;
+  let cnotCount = 0;
+  let quantumGates = 0;
+  for (const gate of circuit.gates) {
+    gatesByKind[gate.kind] = (gatesByKind[gate.kind] ?? 0) + 1;
+    if (MULTI_QUBIT.has(gate.kind)) multiQubitGates++;
+    const cost = GATE_COST[gate.kind];
+    tCount += cost.t;
+    cnotCount += cost.cnot;
+    quantumGates += cost.gates;
+  }
+  return {
+    qubits: circuit.wires.length,
+    inputQubits: circuit.inputs.length,
+    ancillaQubits: circuit.ancillas.length,
+    outputQubits: circuit.outputs.length,
+    gateCount: circuit.gates.length,
+    gatesByKind,
+    multiQubitGates,
+    depth: depth(circuit),
+    projected: {
+      tCount,
+      tDepth: projectedTDepth(circuit),
+      twoQubitGates: cnotCount,
+      gateCount: quantumGates,
+      basis: "Clifford+T, from the documented per-gate decomposition table"
+    }
+  };
+}
+function projectedTDepth(circuit) {
+  const ready = new Int32Array(circuit.wires.length);
+  let maximum = 0;
+  for (const gate of circuit.gates) {
+    const cost = GATE_COST[gate.kind].tDepth;
+    let start = 0;
+    for (const w of gate.wires) start = Math.max(start, ready[w]);
+    const end = start + cost;
+    for (const w of gate.wires) ready[w] = end;
+    if (end > maximum) maximum = end;
+  }
+  return maximum;
+}
+function projectGateCount(nodeCount) {
+  return nodeCount * 3 * 2;
+}
+function projectVerificationOps(inputCount, projectedGates, exhaustiveLimit) {
+  const runs = inputCount <= exhaustiveLimit ? 2 ** inputCount : 2 ** exhaustiveLimit;
+  return runs * projectedGates;
+}
+
+// packages/qsynth-core/src/emit/qasm3.ts
+var QASM_GATE = { x: "x", cnot: "cx", ccnot: "ccx", cswap: "cswap" };
+function emitQasm3(circuit, options) {
+  const lines = [];
+  const measure = options.measure ?? true;
+  lines.push("OPENQASM 3.0;");
+  lines.push('include "stdgates.inc";');
+  lines.push("");
+  lines.push(`// ${circuit.name} \u2014 generated by qsynth ${options.compilerVersion}`);
+  lines.push(`// spec ${options.specHash}`);
+  lines.push("//");
+  lines.push("// Wire map:");
+  for (const wire of circuit.wires) {
+    lines.push(`//   q[${wire.index}]  ${pad(wire.role, 7)} ${wire.name}`);
+  }
+  lines.push("");
+  lines.push(`qubit[${circuit.wires.length}] q;`);
+  if (measure && circuit.outputs.length > 0) lines.push(`bit[${circuit.outputs.length}] c;`);
+  lines.push("");
+  for (const gate of circuit.gates) {
+    const name = QASM_GATE[gate.kind];
+    assertInvariant(name !== void 0, `no OpenQASM mapping for gate ${gate.kind}`);
+    lines.push(`${name} ${gate.wires.map((w) => `q[${w}]`).join(", ")};`);
+  }
+  if (measure && circuit.outputs.length > 0) {
+    lines.push("");
+    circuit.outputs.forEach((output, i) => {
+      lines.push(`c[${i}] = measure q[${output.wire}];  // ${output.name}`);
+    });
+  }
+  lines.push("");
+  return lines.join("\n");
+}
+function pad(text, width) {
+  return text.length >= width ? text : text + " ".repeat(width - text.length);
+}
+function gateListText(circuit) {
+  const label = (w) => {
+    const wire = circuit.wires[w];
+    return `${wire.name} (q${w})`;
+  };
+  return circuit.gates.map((gate, i) => {
+    switch (gate.kind) {
+      case "x":
+        return `${i + 1}. NOT on ${label(gate.wires[0])}`;
+      case "cnot":
+        return `${i + 1}. controlled-NOT: control ${label(gate.wires[0])}, target ${label(gate.wires[1])}`;
+      case "ccnot":
+        return `${i + 1}. Toffoli: controls ${label(gate.wires[0])} and ${label(gate.wires[1])}, target ${label(gate.wires[2])}`;
+      case "cswap":
+        return `${i + 1}. Fredkin: control ${label(gate.wires[0])}, swapping ${label(gate.wires[1])} and ${label(gate.wires[2])}`;
+    }
+  }).join("\n");
+}
+
+// packages/qsynth-core/src/verify/report.ts
+var CHECK_ORDER = [
+  "type_shape",
+  "simulation_equivalence",
+  "reversibility",
+  "garbage_free",
+  "property",
+  "resource"
+];
+var CHECK_TITLES = {
+  type_shape: "Type and shape",
+  simulation_equivalence: "Simulation equivalence",
+  reversibility: "Reversibility",
+  garbage_free: "Garbage-free ancillas",
+  property: "Declared properties",
+  resource: "Resource budgets"
+};
+function buildReport(results, meta) {
+  const failed = results.find((r) => r.status === "failed");
+  const reached = results.filter((r) => r.status !== "skipped").map((r) => r.id);
+  return {
+    passed: failed === void 0,
+    checks: results,
+    checksReached: reached,
+    stoppedAt: failed?.id,
+    durationMs: meta.durationMs,
+    compilerVersion: meta.compilerVersion,
+    specHash: meta.specHash
+  };
+}
+function skipped(id, reason) {
+  return { id, title: CHECK_TITLES[id], status: "skipped", summary: reason, durationMs: 0 };
+}
+
+// packages/qsynth-core/src/util/rng.ts
+var Rng = class {
+  constructor(seed) {
+    this.seed = seed;
+    this.state = seed >>> 0;
+  }
+  seed;
+  state;
+  /** Next uint32. */
+  next() {
+    this.state = this.state + 1831565813 >>> 0;
+    let t = this.state;
+    t = Math.imul(t ^ t >>> 15, t | 1);
+    t ^= t + Math.imul(t ^ t >>> 7, t | 61);
+    return (t ^ t >>> 14) >>> 0;
+  }
+  /** Uniform integer in [0, bound). */
+  below(bound) {
+    return this.next() % bound;
+  }
+  bit() {
+    return this.next() & 1;
+  }
+};
+function seedFromHash(hex) {
+  return parseInt(hex.slice(0, 8), 16) >>> 0;
+}
+
+// packages/qsynth-core/src/verify/checks.ts
+var REVERSIBILITY_SAMPLES = 256;
+function verify(module, circuit, estimate3, options) {
+  const started = now();
+  const results = [];
+  let stopped;
+  const runners = {
+    type_shape: () => checkTypeShape(module, circuit),
+    simulation_equivalence: () => checkEquivalence(module, circuit, options),
+    reversibility: () => checkReversibility(module, circuit, options),
+    garbage_free: () => checkGarbageFree(module, circuit, options),
+    property: () => checkProperties(module, circuit, options),
+    resource: () => checkResources(estimate3, options.budget)
+  };
+  for (const id of CHECK_ORDER) {
+    if (stopped) {
+      results.push(skipped(id, `Not run: the ${CHECK_TITLES[stopped].toLowerCase()} check failed first.`));
+      continue;
+    }
+    const result = runners[id]();
+    results.push(result);
+    options.trace?.add({
+      phase: "verify",
+      kind: `check.${result.status}`,
+      message: `${result.title}: ${result.summary}`,
+      detail: { check: id, status: result.status, durationMs: result.durationMs }
+    });
+    if (result.status === "failed") stopped = id;
+  }
+  return buildReport(results, {
+    compilerVersion: options.compilerVersion,
+    specHash: options.specHash,
+    durationMs: now() - started
+  });
+}
+function checkTypeShape(module, circuit) {
+  const started = now();
+  const problems = [];
+  for (const node of module.nodes) {
+    if (node.args.length !== ARITY[node.op]) {
+      problems.push(`node ${node.id} (${node.op}) has ${node.args.length} operands, expected ${ARITY[node.op]}`);
+    }
+    for (const arg of node.args) {
+      if (arg < 0 || arg >= node.id) problems.push(`node ${node.id} references operand ${arg}, which is not defined before it`);
+    }
+  }
+  for (const binding of [...module.outputs, ...module.assertions]) {
+    if (module.nodes[binding.node] === void 0) problems.push(`"${binding.name}" is bound to node ${binding.node}, which does not exist`);
+  }
+  if (circuit.inputs.length !== module.inputs.length) {
+    problems.push(`circuit has ${circuit.inputs.length} input wires for ${module.inputs.length} declared inputs`);
+  }
+  const expectedOutputs = module.outputs.length + module.assertions.length;
+  if (circuit.outputs.length !== expectedOutputs) {
+    problems.push(`circuit has ${circuit.outputs.length} output wires for ${expectedOutputs} outputs and assertions`);
+  }
+  for (let i = 0; i < circuit.gates.length; i++) {
+    const gate = circuit.gates[i];
+    if (gate.wires.length !== GATE_ARITY[gate.kind]) {
+      problems.push(`gate ${i} (${gate.kind}) names ${gate.wires.length} wires, expected ${GATE_ARITY[gate.kind]}`);
+    }
+    if (new Set(gate.wires).size !== gate.wires.length) problems.push(`gate ${i} (${gate.kind}) names the same wire twice`);
+    for (const w of gate.wires) {
+      if (w < 0 || w >= circuit.wires.length) problems.push(`gate ${i} references wire ${w}, which is not declared`);
+    }
+  }
+  const inputWires = new Set(circuit.inputs.map((i) => i.wire));
+  for (let i = 0; i < circuit.gates.length; i++) {
+    const gate = circuit.gates[i];
+    for (const w of targetsOf(gate)) {
+      if (inputWires.has(w)) problems.push(`gate ${i} (${gate.kind}) writes to input wire ${w}`);
+    }
+  }
+  return {
+    id: "type_shape",
+    title: CHECK_TITLES.type_shape,
+    status: problems.length === 0 ? "passed" : "failed",
+    summary: problems.length === 0 ? `${module.inputs.length} input bit(s), ${module.outputs.length} output(s) and ${circuit.gates.length} gates are consistently shaped, and no gate writes to an input wire.` : `${problems.length} shape problem(s) found; the first is: ${problems[0]}.`,
+    durationMs: now() - started,
+    evidence: problems.length === 0 ? void 0 : { problems: problems.slice(0, 20), total: problems.length }
+  };
+}
+function planAssignments(module, options) {
+  const n = module.inputs.length;
+  const space = 2 ** n;
+  const dontCare = new Set(module.dontCare);
+  const limit = options.exhaustiveLimit ?? EXHAUSTIVE_INPUT_LIMIT;
+  if (n <= limit) {
+    const assignments2 = [];
+    for (let a = 0; a < space; a++) if (!dontCare.has(a)) assignments2.push(a);
+    return {
+      assignments: assignments2,
+      coverage: { mode: "exhaustive", checked: assignments2.length, space, dontCare: dontCare.size }
+    };
+  }
+  const seed = options.seed ?? 1;
+  const rng = new Rng(seed);
+  const wanted = options.sampleCount ?? 4096;
+  const seen = /* @__PURE__ */ new Set();
+  const assignments = [];
+  for (let attempts = 0; attempts < wanted * 4 && assignments.length < wanted; attempts++) {
+    let a = 0;
+    for (let bit = 0; bit < n; bit++) if (rng.bit() === 1) a += 2 ** bit;
+    if (dontCare.has(a) || seen.has(a)) continue;
+    seen.add(a);
+    assignments.push(a);
+  }
+  return {
+    assignments,
+    coverage: { mode: "sampled", checked: assignments.length, space, dontCare: dontCare.size, seed }
+  };
+}
+function namedInputs(module, bits) {
+  const record = {};
+  module.inputs.forEach((input, i) => record[input.name] = bits[i]);
+  return record;
+}
+function checkEquivalence(module, circuit, options) {
+  const started = now();
+  const plan = planAssignments(module, options);
+  const outputWires = module.outputs.map((_, i) => circuit.outputs[i].wire);
+  let counterexample;
+  for (const assignment of plan.assignments) {
+    const bits = assignmentToBits(assignment, module.inputs.length);
+    const expected = evaluate(module, bits).outputs;
+    const state = run(circuit, initialState(circuit, bits));
+    for (let i = 0; i < module.outputs.length; i++) {
+      const name = module.outputs[i].name;
+      if (state[outputWires[i]] !== expected[name]) {
+        const observed = {};
+        module.outputs.forEach((o, j) => observed[o.name] = state[outputWires[j]]);
+        counterexample = { inputs: namedInputs(module, bits), expected, observed, assignment };
+        break;
+      }
+    }
+    if (counterexample) break;
+  }
+  const { coverage } = plan;
+  const scope = coverage.mode === "exhaustive" ? `all ${coverage.checked} of ${coverage.space} input assignments` : `${coverage.checked} of ${coverage.space} input assignments sampled with seed ${coverage.seed}`;
+  return {
+    id: "simulation_equivalence",
+    title: CHECK_TITLES.simulation_equivalence,
+    status: counterexample ? "failed" : "passed",
+    summary: counterexample ? `The circuit disagrees with the specification on at least one input assignment (${describe3(counterexample)}).` : `The circuit matches the specification on ${scope}` + (coverage.dontCare > 0 ? `, with ${coverage.dontCare} unconstrained assignment(s) excluded.` : "."),
+    durationMs: now() - started,
+    coverage,
+    counterexample
+  };
+}
+function describe3(cex) {
+  const inputs = Object.entries(cex.inputs).map(([k, v]) => `${k}=${v}`).join(", ");
+  const wrong = Object.keys(cex.expected).filter((k) => cex.expected[k] !== cex.observed[k]);
+  const detail = wrong.map((k) => `${k} expected ${cex.expected[k]}, got ${cex.observed[k]}`).join("; ");
+  return `${inputs} \u2192 ${detail}`;
+}
+function checkReversibility(module, circuit, options) {
+  const started = now();
+  const inverse = invert(circuit);
+  const width = circuit.wires.length;
+  const rng = new Rng(options.seed ?? 1);
+  const states = [new Uint8Array(width), new Uint8Array(width).fill(1)];
+  for (let i = 0; i < REVERSIBILITY_SAMPLES; i++) {
+    const s = new Uint8Array(width);
+    for (let w = 0; w < width; w++) s[w] = rng.bit();
+    states.push(s);
+  }
+  for (const assignment of firstFew(module, 16)) {
+    states.push(initialState(circuit, assignmentToBits(assignment, module.inputs.length)));
+  }
+  let failure;
+  for (const start of states) {
+    const state = Uint8Array.from(start);
+    run(circuit, state);
+    run(inverse, state);
+    for (let w = 0; w < width; w++) {
+      if (state[w] !== start[w]) {
+        failure = { start: [...start], end: [...state] };
+        break;
+      }
+    }
+    if (failure) break;
+  }
+  return {
+    id: "reversibility",
+    title: CHECK_TITLES.reversibility,
+    status: failure ? "failed" : "passed",
+    summary: failure ? "Running the circuit followed by its inverse did not return the wires to their starting values, so the circuit is not reversible as built." : `Running the circuit followed by its inverse returned every wire to its starting value on ${states.length} states, including the all-zero and all-one states. Each gate permutes basis states exactly, so this holds without a numerical tolerance.`,
+    durationMs: now() - started,
+    evidence: failure ? { startState: failure.start, endState: failure.end } : { statesChecked: states.length, tolerance: "exact" }
+  };
+}
+function firstFew(module, count) {
+  const dontCare = new Set(module.dontCare);
+  const out = [];
+  const space = 2 ** module.inputs.length;
+  for (let a = 0; a < space && out.length < count; a++) if (!dontCare.has(a)) out.push(a);
+  return out;
+}
+function checkGarbageFree(module, circuit, options) {
+  const started = now();
+  const plan = planAssignments(module, options);
+  const dirty = /* @__PURE__ */ new Map();
+  let inputsDisturbed;
+  for (const assignment of plan.assignments) {
+    const bits = assignmentToBits(assignment, module.inputs.length);
+    const result = simulate(circuit, bits);
+    result.ancillasAtEnd.forEach((value, i) => {
+      if (value !== 0) {
+        const existing = dirty.get(i);
+        if (existing) existing.count++;
+        else dirty.set(i, { count: 1, firstAssignment: assignment });
+      }
+    });
+    if (!inputsDisturbed) {
+      for (let i = 0; i < bits.length; i++) {
+        if (result.inputsAtEnd[i] !== bits[i]) {
+          inputsDisturbed = { assignment, name: module.inputs[i].name };
+          break;
+        }
+      }
+    }
+  }
+  const ledger = circuit.ancillas.map((record, index) => ({
+    wire: record.wire,
+    purpose: record.purpose,
+    allocatedAtGate: record.allocatedAtGate,
+    uncomputedAtGate: record.uncomputedAtGate,
+    releasedAtGate: record.releasedAtGate,
+    returnedToZero: !dirty.has(index),
+    ...dirty.has(index) ? { dirtyOnAssignments: dirty.get(index).count, firstDirtyAssignment: dirty.get(index).firstAssignment } : {}
+  }));
+  const failed = dirty.size > 0 || inputsDisturbed !== void 0;
+  const summary = inputsDisturbed ? `Input "${inputsDisturbed.name}" did not hold its original value at the end of the circuit, so the circuit is not in Bennett form.` : dirty.size > 0 ? `${dirty.size} of ${circuit.ancillas.length} ancilla(s) did not return to |0\u27E9; the first is wire ${ledger.find((l) => !l.returnedToZero).wire} (${ledger.find((l) => !l.returnedToZero).purpose}).` : `All ${circuit.ancillas.length} ancilla(s) returned to |0\u27E9 on ${plan.coverage.checked} input assignment(s), and every input still held its original value.`;
+  return {
+    id: "garbage_free",
+    title: CHECK_TITLES.garbage_free,
+    status: failed ? "failed" : "passed",
+    summary,
+    durationMs: now() - started,
+    coverage: plan.coverage,
+    evidence: { ancillas: ledger }
+  };
+}
+function checkProperties(module, circuit, options) {
+  const started = now();
+  if (module.assertions.length === 0) {
+    return skipped("property", "The specification declares no invariants, so there was nothing to check.");
+  }
+  const plan = planAssignments(module, options);
+  const assertionWires = module.assertions.map((_, i) => circuit.outputs[module.outputs.length + i].wire);
+  const violations = /* @__PURE__ */ new Map();
+  for (const assignment of plan.assignments) {
+    const bits = assignmentToBits(assignment, module.inputs.length);
+    const state = run(circuit, initialState(circuit, bits));
+    module.assertions.forEach((binding, i) => {
+      if (state[assertionWires[i]] === 1) return;
+      const existing = violations.get(binding.name);
+      if (existing) existing.count++;
+      else violations.set(binding.name, { assignment, inputs: namedInputs(module, bits), count: 1 });
+    });
+  }
+  const verdicts = module.assertions.map((binding, i) => ({
+    name: binding.name,
+    wire: assertionWires[i],
+    held: !violations.has(binding.name),
+    ...violations.has(binding.name) ? {
+      violatedOnAssignments: violations.get(binding.name).count,
+      firstViolation: violations.get(binding.name).inputs
+    } : {}
+  }));
+  const first = violations.entries().next();
+  const counterexample = first.done ? void 0 : {
+    inputs: first.value[1].inputs,
+    expected: { [first.value[0]]: 1 },
+    observed: { [first.value[0]]: 0 },
+    assignment: first.value[1].assignment
+  };
+  return {
+    id: "property",
+    title: CHECK_TITLES.property,
+    status: violations.size === 0 ? "passed" : "failed",
+    summary: violations.size === 0 ? `All ${module.assertions.length} declared invariant(s) held on ${plan.coverage.checked} input assignment(s).` : `${violations.size} of ${module.assertions.length} declared invariant(s) do not hold; "${first.value[0]}" fails on ${Object.entries(first.value[1].inputs).map(([k, v]) => `${k}=${v}`).join(", ")}.`,
+    durationMs: now() - started,
+    coverage: plan.coverage,
+    counterexample,
+    evidence: { assertions: verdicts }
+  };
+}
+function checkResources(estimate3, budget) {
+  const started = now();
+  const declared = BUDGET_FIELDS.filter((f) => budget?.[f.key] !== void 0);
+  if (declared.length === 0) {
+    return skipped("resource", "The specification declares no resource budgets, so there was nothing to enforce.");
+  }
+  const comparisons = declared.map((field) => {
+    const limit = budget[field.key];
+    const actual = field.actual(estimate3);
+    return { budget: field.key, label: field.label, limit, actual, withinBudget: actual <= limit, projected: field.projected };
+  });
+  const exceeded = comparisons.filter((c) => !c.withinBudget);
+  return {
+    id: "resource",
+    title: CHECK_TITLES.resource,
+    status: exceeded.length === 0 ? "passed" : "failed",
+    summary: exceeded.length === 0 ? `All ${comparisons.length} declared budget(s) are met: ${comparisons.map((c) => `${c.actual}/${c.limit} ${c.label}`).join(", ")}.` : `${exceeded.length} declared budget(s) exceeded: ${exceeded.map((c) => `${c.label} is ${c.actual}, budget is ${c.limit}`).join("; ")}.`,
+    durationMs: now() - started,
+    evidence: { comparisons }
+  };
+}
+function now() {
+  return performance.now();
+}
+
+// packages/qsynth-core/src/compile.ts
+var SPEC_KINDS = ["boolean", "truthtable"];
+var MAX_VERIFICATION_OPS = 5e7;
+function preflight(module) {
+  const projectedGates = projectGateCount(module.nodes.length);
+  const ops = projectVerificationOps(module.inputs.length, projectedGates, EXHAUSTIVE_INPUT_LIMIT);
+  const accepted = ops <= MAX_VERIFICATION_OPS;
+  return {
+    accepted,
+    nodes: module.nodes.length,
+    inputs: module.inputs.length,
+    projectedGates,
+    projectedVerificationOps: ops,
+    limit: MAX_VERIFICATION_OPS,
+    reason: accepted ? void 0 : `Verifying this specification is projected to take about ${Math.round(ops / 1e6)} million simulation steps; the limit for a single request is ${MAX_VERIFICATION_OPS / 1e6} million. It has ${module.inputs.length} input bit(s) and ${module.nodes.length} operation(s).`
+  };
+}
+function parseSpec(request, trace) {
+  const name = request.name ?? "module";
+  switch (request.kind) {
+    case "boolean":
+      return lowerBoolean(request.source, { moduleName: name, trace });
+    case "truthtable":
+      return lowerTruthTable(request.source, { moduleName: name, trace });
+    default:
+      throw invalidSpec(
+        `Unknown specification kind "${request.kind}".`,
+        `Supported kinds are: ${SPEC_KINDS.join(", ")}.`,
+        { supported: SPEC_KINDS }
+      );
+  }
+}
+function compile(request) {
+  const started = performance.now();
+  const trace = new TraceRecorder();
+  const stages = [];
+  const specHash = contentHash({ kind: request.kind, source: request.source });
+  const stage = (name, fn) => {
+    const stageStarted = performance.now();
+    try {
+      const value = fn();
+      stages.push({ stage: name, status: "passed", durationMs: performance.now() - stageStarted });
+      return value;
+    } catch (error) {
+      stages.push({
+        stage: name,
+        status: "failed",
+        durationMs: performance.now() - stageStarted,
+        errorCode: error instanceof QsynthError ? error.code : "INTERNAL"
+      });
+      throw error;
+    }
+  };
+  const module = stage("parse", () => {
+    const parsed = parseSpec(request, trace);
+    const check = preflight(parsed);
+    if (!check.accepted) {
+      throw new QsynthError(
+        "BUDGET_EXCEEDED",
+        check.reason,
+        "Reduce the number of input bits, or split the design into smaller modules that are verified separately.",
+        { details: { ...check } }
+      );
+    }
+    trace.add({
+      phase: "parse",
+      kind: "preflight",
+      message: `The specification has ${check.inputs} input bit(s) and ${check.nodes} operation(s); verification is projected to take about ${check.projectedVerificationOps.toLocaleString("en-US")} simulation steps.`,
+      detail: { ...check }
+    });
+    return parsed;
+  });
+  const { circuit } = stage("lower", () => lowerToReversible(module, trace));
+  const resourceEstimate = stage("estimate", () => {
+    const value = estimate(circuit);
+    trace.add({
+      phase: "estimate",
+      kind: "resources",
+      message: `The circuit uses ${value.qubits} qubit(s) \u2014 ${value.inputQubits} input, ${value.ancillaQubits} ancilla, ${value.outputQubits} output \u2014 with ${value.gateCount} reversible gates at depth ${value.depth}. Decomposed to Clifford+T this is projected at ${value.projected.tCount} T gates, T-depth ${value.projected.tDepth}.`,
+      detail: { ...value }
+    });
+    return value;
+  });
+  const report = stage(
+    "verify",
+    () => verify(module, circuit, resourceEstimate, {
+      budget: request.budget,
+      compilerVersion: COMPILER_VERSION,
+      specHash,
+      sampleCount: request.sampleCount,
+      seed: seedFromHash(specHash),
+      trace
+    })
+  );
+  const qasm = stage("emit", () => {
+    const text = emitQasm3(circuit, { compilerVersion: COMPILER_VERSION, specHash });
+    trace.add({
+      phase: "emit",
+      kind: "qasm",
+      message: `${circuit.gates.length} gate(s) were written as OpenQASM 3.0 using only gates from stdgates.inc.`,
+      detail: { bytes: text.length }
+    });
+    return text;
+  });
+  return {
+    module,
+    circuit,
+    estimate: resourceEstimate,
+    report,
+    qasm,
+    gateList: gateListText(circuit),
+    trace: trace.toArray(),
+    stages,
+    specHash,
+    artifactHash: contentHash(qasm),
+    compilerVersion: COMPILER_VERSION,
+    durationMs: performance.now() - started
+  };
+}
+function estimateOnly(request) {
+  const started = performance.now();
+  const trace = new TraceRecorder();
+  const specHash = contentHash({ kind: request.kind, source: request.source });
+  const stages = [];
+  const parseStarted = performance.now();
+  const module = parseSpec(request, trace);
+  stages.push({ stage: "parse", status: "passed", durationMs: performance.now() - parseStarted });
+  const check = preflight(module);
+  const lowerStarted = performance.now();
+  const { circuit } = lowerToReversible(module, trace);
+  stages.push({ stage: "lower", status: "passed", durationMs: performance.now() - lowerStarted });
+  const estimateStarted = performance.now();
+  const value = estimate(circuit);
+  stages.push({ stage: "estimate", status: "passed", durationMs: performance.now() - estimateStarted });
+  return { estimate: value, preflight: check, stages, specHash, durationMs: performance.now() - started };
+}
+
+// functions/api/src/storage.ts
+import { GetObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
+var PREFIX = "artifacts";
+var client;
+function s3() {
+  if (!client) client = new S3Client({ region: process.env["AWS_REGION"] ?? "us-east-1" });
+  return client;
+}
+function bucket() {
+  const name = process.env["STORAGE_BUCKET"];
+  if (!name) throw new Error("STORAGE_BUCKET is not set; artifact storage is unavailable");
+  return name;
+}
+async function write(orgId, contentHash2, contentType, body) {
+  const key = `${PREFIX}/${orgId}/${contentHash2}`;
+  const bytes = Buffer.from(body, "utf8");
+  await s3().send(
+    new PutObjectCommand({
+      Bucket: bucket(),
+      Key: key,
+      Body: bytes,
+      ContentType: contentType,
+      // Content-addressed: the bytes under a key can never change, so anything holding
+      // them may cache indefinitely.
+      CacheControl: "private, max-age=31536000, immutable"
+    })
+  );
+  return { contentHash: contentHash2, storageUri: `s3://${bucket()}/${key}`, sizeBytes: bytes.byteLength };
+}
+async function read(storageUri) {
+  const expected = `s3://${bucket()}/${PREFIX}/`;
+  if (!storageUri.startsWith(expected)) {
+    throw new ApiError(
+      "INTERNAL",
+      "The stored artifact location is not a valid artifact URI.",
+      "Contact support with the artifact identifier."
+    );
+  }
+  const key = storageUri.slice(`s3://${bucket()}/`.length);
+  const response = await s3().send(new GetObjectCommand({ Bucket: bucket(), Key: key }));
+  const body = response.Body;
+  if (!body) {
+    throw new ApiError(
+      "NOT_FOUND",
+      "The artifact metadata exists but its bytes are missing from storage.",
+      "Recompile the specification to regenerate the artifact."
+    );
+  }
+  return body.transformToString("utf8");
+}
+
+// functions/api/src/routes/compile.ts
+var MAX_SAMPLE_COUNT = 65536;
+var BUDGET_KEYS = BUDGET_FIELDS.map((f) => f.key);
+function fromCompiler(error) {
+  if (!(error instanceof QsynthError)) throw error;
+  if (error.code === "INTERNAL") throw error;
+  throw new ApiError(error.code, error.message, error.hint, {
+    ...error.details,
+    ...error.span ? { span: error.span } : {}
+  });
+}
+function withCompilerErrors(fn) {
+  try {
+    return fn();
+  } catch (error) {
+    fromCompiler(error);
+  }
+}
+function requireKind(body) {
+  const kind = body["kind"];
+  if (typeof kind !== "string" || !SPEC_KINDS.includes(kind)) {
+    throw invalid(
+      `Field "kind" must be one of: ${SPEC_KINDS.join(", ")}.`,
+      'Use "boolean" for expressions and "truthtable" for tables.',
+      { field: "kind", supported: SPEC_KINDS }
+    );
+  }
+  return kind;
+}
+function requireSource(body) {
+  const source = body["source"];
+  if (typeof source !== "string" || source.trim() === "") {
+    throw invalid('Field "source" is required and must be a non-empty string.', 'Include the specification text in "source".', {
+      field: "source"
+    });
+  }
+  if (source.length > MAX_SOURCE_BYTES) {
+    throw new ApiError(
+      "SPEC_TOO_LARGE",
+      `The specification is ${source.length} characters long; the limit is ${MAX_SOURCE_BYTES}.`,
+      "Split the design into smaller modules that are compiled and verified separately.",
+      { length: source.length, limit: MAX_SOURCE_BYTES }
+    );
+  }
+  return source;
+}
+function parseBudget(raw) {
+  if (raw === void 0 || raw === null) return void 0;
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw invalid('Field "budget" must be an object.', `Budget fields are: ${BUDGET_KEYS.join(", ")}.`, { field: "budget" });
+  }
+  const out = {};
+  for (const [key, value] of Object.entries(raw)) {
+    if (!BUDGET_KEYS.includes(key)) {
+      throw invalid(`"${key}" is not a budget field.`, `Budget fields are: ${BUDGET_KEYS.join(", ")}.`, { field: `budget.${key}` });
+    }
+    if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+      throw invalid(`Budget field "${key}" must be a non-negative integer.`, "Declare the limit as a whole number of units.", {
+        field: `budget.${key}`
+      });
+    }
+    out[key] = value;
+  }
+  return Object.keys(out).length > 0 ? out : void 0;
+}
+function parseSampleCount(raw) {
+  if (raw === void 0 || raw === null) return void 0;
+  if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 1 || raw > MAX_SAMPLE_COUNT) {
+    throw invalid(
+      `Field "sampleCount" must be a whole number between 1 and ${MAX_SAMPLE_COUNT}.`,
+      "Omit it to use the default, which is chosen from the size of the input space.",
+      { field: "sampleCount", limit: MAX_SAMPLE_COUNT }
+    );
+  }
+  return raw;
+}
+var jobView = (j) => ({
+  id: j.id,
+  projectId: j.project_id,
+  specId: j.spec_id,
+  specHash: j.spec_hash,
+  status: j.status,
+  seed: Number(j.seed),
+  compilerVersion: j.compiler_version,
+  errorCode: j.error_code,
+  errorMessage: j.error_message,
+  startedAt: j.started_at,
+  finishedAt: j.finished_at
+});
+var resourceView = (e) => ({
+  measured: {
+    qubits: e.qubits,
+    inputQubits: e.inputQubits,
+    ancillaQubits: e.ancillaQubits,
+    outputQubits: e.outputQubits,
+    gateCount: e.gateCount,
+    gatesByKind: e.gatesByKind,
+    multiQubitGates: e.multiQubitGates,
+    depth: e.depth
+  },
+  projected: e.projected
+});
+var reportView = (report) => ({
+  passed: report.passed,
+  checks: report.checks,
+  checksReached: report.checksReached,
+  stoppedAt: report.stoppedAt ?? null,
+  durationMs: report.durationMs,
+  compilerVersion: report.compilerVersion,
+  specHash: report.specHash
+});
+function methodOf(report) {
+  const coverage = report.checks.find((c) => c.id === "simulation_equivalence")?.coverage;
+  if (!coverage) return { method: "exhaustive", sampleCount: null };
+  return { method: coverage.mode, sampleCount: coverage.mode === "sampled" ? coverage.checked : null };
+}
+function failureDetail(report) {
+  const failed = report.checks.find((c) => c.status === "failed");
+  if (!failed) return {};
+  return {
+    check: {
+      id: failed.id,
+      title: failed.title,
+      summary: failed.summary,
+      ...failed.counterexample ? { counterexample: failed.counterexample } : {},
+      ...failed.evidence ? { evidence: failed.evidence } : {}
+    },
+    checksReached: report.checksReached
+  };
+}
+async function upsertSpec(tx, ctx, input) {
+  const existing = await tx.one(
+    "select * from specs where project_id = $1 and content_hash = $2 and kind = $3",
+    [input.projectId, input.hash, input.kind]
+  );
+  if (existing) return existing;
+  const row = await tx.one(
+    `insert into specs (org_id, project_id, name, kind, source, budgets, content_hash, created_by)
+     values ($1, $2, $3, $4, $5, $6, $7, $8) returning *`,
+    [
+      ctx.principal.orgId,
+      input.projectId,
+      input.name,
+      input.kind,
+      input.source,
+      JSON.stringify(input.budget ?? {}),
+      input.hash,
+      ctx.principal.kind === "session" ? ctx.principal.userId : null
+    ]
+  );
+  return row;
+}
+function uploads(result) {
+  return [
+    { kind: "qasm3", contentType: "text/plain; charset=utf-8", body: result.qasm },
+    { kind: "reversible_ir", contentType: "application/json", body: JSON.stringify(result.circuit) },
+    { kind: "trace", contentType: "application/json", body: JSON.stringify(result.trace) }
+  ];
+}
+async function recordArtifacts(tx, orgId, jobId, stored) {
+  const out = [];
+  for (const item of stored) {
+    const row = await tx.one(
+      `insert into artifacts (org_id, kind, content_hash, storage_uri, size_bytes)
+       values ($1, $2, $3, $4, $5)
+       on conflict (org_id, content_hash) do update set storage_uri = excluded.storage_uri
+       returning id`,
+      [orgId, item.kind, item.contentHash, item.storageUri, item.sizeBytes]
+    );
+    await tx.query(
+      `insert into compile_job_artifacts (org_id, job_id, artifact_id, kind)
+       values ($1, $2, $3, $4) on conflict (job_id, kind) do nothing`,
+      [orgId, jobId, row.id, item.kind]
+    );
+    out.push({ id: row.id, kind: item.kind, contentHash: item.contentHash, sizeBytes: item.sizeBytes });
+  }
+  return out;
+}
+async function recordStages(tx, orgId, jobId, stages) {
+  for (const [ordinal, stage] of stages.entries()) {
+    await tx.query(
+      `insert into compile_stages (org_id, job_id, ordinal, stage, status, duration_ms, error_code)
+       values ($1, $2, $3, $4, $5, $6, $7)`,
+      [orgId, jobId, ordinal, stage.stage, stage.status === "passed" ? "ok" : "failed", Math.round(stage.durationMs), stage.errorCode ?? null]
+    );
+  }
+}
+async function recordEvent(tx, orgId, jobId, from, to, detail) {
+  await tx.query(
+    "insert into compile_job_events (org_id, job_id, from_status, to_status, detail) values ($1,$2,$3,$4,$5)",
+    [orgId, jobId, from, to, JSON.stringify(detail)]
+  );
+}
+async function nextVersion(tx, orgId, specId, projectId, jobId) {
+  const previous = await tx.one(
+    "select id, version from circuit_versions where spec_id = $1 order by version desc limit 1",
+    [specId]
+  );
+  const row = await tx.one(
+    `insert into circuit_versions (org_id, project_id, spec_id, job_id, version, parent_version_id)
+     values ($1, $2, $3, $4, $5, $6) returning id, version`,
+    [orgId, projectId, specId, jobId, (previous?.version ?? 0) + 1, previous?.id ?? null]
+  );
+  return { id: row.id, number: row.version };
+}
+async function run2(ctx) {
+  const projectId = requireString(ctx.body, "projectId");
+  const kind = requireKind(ctx.body);
+  const source = requireSource(ctx.body);
+  const name = optionalString(ctx.body, "name") || "module";
+  const budget = parseBudget(ctx.body["budget"]);
+  const sampleCount = parseSampleCount(ctx.body["sampleCount"]);
+  const specHash = contentHash({ kind, source });
+  const orgId = ctx.principal.orgId;
+  const parsed = withCompilerErrors(() => parseSpec({ kind, source, name }, new TraceRecorder()));
+  const projection = preflight(parsed);
+  const accepted = await orgTx(ctx, async (tx) => {
+    const project = await tx.one("select id from projects where id = $1", [projectId]);
+    if (!project) throw notFound("Project");
+    const spec = await upsertSpec(tx, ctx, { projectId, name, kind, source, budget, hash: specHash });
+    if (projection.accepted) return { rejected: false, spec };
+    const job = await tx.one(
+      `insert into compile_jobs (org_id, project_id, spec_id, spec_hash, status, seed, compiler_version, error_code, error_message, created_by, finished_at)
+       values ($1,$2,$3,$4,'rejected',$5,$6,'BUDGET_EXCEEDED',$7,$8, now()) returning *`,
+      [orgId, projectId, spec.id, specHash, seedFromHash(specHash), COMPILER_VERSION, projection.reason ?? "", ctx.principal.kind === "session" ? ctx.principal.userId : null]
+    );
+    await recordEvent(tx, orgId, job.id, null, "rejected", { preflight: { ...projection } });
+    await audit(tx, ctx.principal, {
+      action: "compile.rejected",
+      resourceType: "compile_job",
+      resourceId: job.id,
+      ip: ctx.ip,
+      userAgent: ctx.userAgent,
+      metadata: { specHash, projectedVerificationOps: projection.projectedVerificationOps }
+    });
+    return { rejected: true, jobId: job.id };
+  });
+  if (accepted.rejected) {
+    throw new ApiError("BUDGET_EXCEEDED", projection.reason, "Reduce the number of input bits, or split the design into smaller modules that are verified separately.", {
+      jobId: accepted.jobId,
+      preflight: { ...projection }
+    });
+  }
+  const specId = accepted.spec.id;
+  let result;
+  try {
+    result = compile({ kind, source, name, budget, sampleCount });
+  } catch (error) {
+    if (error instanceof QsynthError && error.code !== "INTERNAL") {
+      await orgTx(ctx, async (tx) => {
+        const job = await tx.one(
+          `insert into compile_jobs (org_id, project_id, spec_id, spec_hash, status, seed, compiler_version, error_code, error_message, created_by, finished_at)
+           values ($1,$2,$3,$4,'failed',$5,$6,$7,$8,$9, now()) returning *`,
+          [orgId, projectId, specId, specHash, seedFromHash(specHash), COMPILER_VERSION, error.code, error.message, ctx.principal.kind === "session" ? ctx.principal.userId : null]
+        );
+        await recordEvent(tx, orgId, job.id, null, "failed", { code: error.code });
+      });
+    }
+    fromCompiler(error);
+  }
+  const stored = await Promise.all(
+    uploads(result).map(async (upload) => ({
+      ...upload,
+      ...await write(orgId, contentHash(upload.body), upload.contentType, upload.body)
+    }))
+  );
+  const { method, sampleCount: usedSamples } = methodOf(result.report);
+  const status = result.report.passed ? "succeeded" : "failed";
+  const persisted = await orgTx(ctx, async (tx) => {
+    const job = await tx.one(
+      `insert into compile_jobs (org_id, project_id, spec_id, spec_hash, status, seed, compiler_version, error_code, error_message, created_by, finished_at)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, now()) returning *`,
+      [
+        orgId,
+        projectId,
+        specId,
+        specHash,
+        status,
+        seedFromHash(specHash),
+        COMPILER_VERSION,
+        result.report.passed ? null : "VERIFICATION_FAILED",
+        result.report.passed ? null : result.report.checks.find((c) => c.status === "failed")?.summary ?? null,
+        ctx.principal.kind === "session" ? ctx.principal.userId : null
+      ]
+    );
+    const jobId = job.id;
+    await recordStages(tx, orgId, jobId, result.stages);
+    await recordEvent(tx, orgId, jobId, null, status, { durationMs: Math.round(result.durationMs), artifactHash: result.artifactHash });
+    await tx.query(
+      `insert into verification_reports (org_id, job_id, passed, method, sample_count, seed, checks)
+       values ($1,$2,$3,$4,$5,$6,$7)`,
+      [orgId, jobId, result.report.passed, method, usedSamples, seedFromHash(specHash), JSON.stringify(result.report.checks)]
+    );
+    const e = result.estimate;
+    await tx.query(
+      `insert into resource_estimates (org_id, job_id, qubits, ancillas, depth, gate_count, two_qubit_count, t_count, t_depth)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+      // Measured: qubits, ancillas, depth, gate_count. Projected onto Clifford+T:
+      // two_qubit_count, t_count, t_depth. The API response labels which is which.
+      [orgId, jobId, e.qubits, e.ancillaQubits, e.depth, e.gateCount, e.projected.twoQubitGates, e.projected.tCount, e.projected.tDepth]
+    );
+    const artifacts = await recordArtifacts(tx, orgId, jobId, stored);
+    const version = await nextVersion(tx, orgId, specId, projectId, jobId);
+    await audit(tx, ctx.principal, {
+      action: result.report.passed ? "compile.succeeded" : "compile.failed",
+      resourceType: "compile_job",
+      resourceId: jobId,
+      ip: ctx.ip,
+      userAgent: ctx.userAgent,
+      metadata: { specHash, artifactHash: result.artifactHash, passed: result.report.passed, qubits: e.qubits }
+    });
+    return { job, artifacts, version };
+  });
+  const body = {
+    job: jobView(persisted.job),
+    stages: result.stages,
+    verification: reportView(result.report),
+    resources: resourceView(result.estimate),
+    artifacts: persisted.artifacts,
+    version: persisted.version,
+    specHash,
+    artifactHash: result.artifactHash,
+    gateList: result.gateList,
+    qasm: result.report.passed ? result.qasm : void 0
+  };
+  if (!result.report.passed) {
+    throw new ApiError(
+      "VERIFICATION_FAILED",
+      result.report.checks.find((c) => c.status === "failed")?.summary ?? "Verification did not pass.",
+      `The circuit was not exported. Inspect the failing check at GET /v1/compile/${persisted.job.id} and correct the specification or the declared budget.`,
+      { jobId: persisted.job.id, ...failureDetail(result.report) }
+    );
+  }
+  return created(body);
+}
+async function estimate2(ctx) {
+  const kind = requireKind(ctx.body);
+  const source = requireSource(ctx.body);
+  const name = optionalString(ctx.body, "name") || "module";
+  const result = withCompilerErrors(() => estimateOnly({ kind, source, name }));
+  return ok({
+    specHash: result.specHash,
+    preflight: result.preflight,
+    resources: resourceView(result.estimate),
+    stages: result.stages,
+    durationMs: result.durationMs,
+    verified: false
+  });
+}
+async function list5(ctx) {
+  const projectId = ctx.query.get("projectId");
+  const limit = Math.min(Number(ctx.query.get("limit") ?? 50) || 50, 200);
+  const rows = await orgTx(
+    ctx,
+    (tx) => tx.query(
+      `select j.*, vr.passed
+         from compile_jobs j
+         left join verification_reports vr on vr.job_id = j.id
+        where ($1::uuid is null or j.project_id = $1::uuid)
+        order by j.started_at desc
+        limit $2`,
+      [projectId, limit]
+    )
+  );
+  return ok({ jobs: rows.map((r) => ({ ...jobView(r), passed: r.passed })) });
+}
+async function get2(ctx) {
+  const id = ctx.params["id"];
+  const data = await orgTx(ctx, async (tx) => {
+    const job = await tx.one("select * from compile_jobs where id = $1", [id]);
+    if (!job) throw notFound("Compile job");
+    const stages = await tx.query(
+      "select stage, status, duration_ms, error_code from compile_stages where job_id = $1 order by ordinal",
+      [id]
+    );
+    const report = await tx.one(
+      "select passed, method, sample_count, seed, checks from verification_reports where job_id = $1",
+      [id]
+    );
+    const resources = await tx.one(
+      `select qubits, ancillas, depth, gate_count, two_qubit_count, t_count, t_depth
+         from resource_estimates where job_id = $1`,
+      [id]
+    );
+    const artifacts = await tx.query(
+      `select a.id, ja.kind, a.content_hash, a.size_bytes
+         from compile_job_artifacts ja join artifacts a on a.id = ja.artifact_id
+        where ja.job_id = $1 order by ja.kind`,
+      [id]
+    );
+    const spec = await tx.one("select * from specs where id = $1", [job.spec_id]);
+    const version = await tx.one(
+      "select id, version from circuit_versions where job_id = $1",
+      [id]
+    );
+    return { job, stages, report, resources, artifacts, spec, version };
+  });
+  return ok({
+    job: jobView(data.job),
+    spec: data.spec ? { id: data.spec.id, name: data.spec.name, kind: data.spec.kind, source: data.spec.source, budgets: data.spec.budgets } : null,
+    stages: data.stages.map((s) => ({ stage: s.stage, status: s.status, durationMs: s.duration_ms, errorCode: s.error_code })),
+    verification: data.report ? {
+      passed: data.report.passed,
+      method: data.report.method,
+      sampleCount: data.report.sample_count,
+      seed: Number(data.report.seed),
+      checks: data.report.checks,
+      checksReached: data.report.checks.filter((c) => c.status !== "skipped").map((c) => c.id),
+      stoppedAt: data.report.checks.find((c) => c.status === "failed")?.id ?? null
+    } : null,
+    resources: data.resources ? {
+      measured: {
+        qubits: data.resources["qubits"],
+        ancillaQubits: data.resources["ancillas"],
+        depth: data.resources["depth"],
+        gateCount: data.resources["gate_count"]
+      },
+      projected: {
+        twoQubitGates: data.resources["two_qubit_count"],
+        tCount: data.resources["t_count"],
+        tDepth: data.resources["t_depth"]
+      }
+    } : null,
+    artifacts: data.artifacts.map((a) => ({ id: a.id, kind: a.kind, contentHash: a.content_hash, sizeBytes: a.size_bytes })),
+    version: data.version ? { id: data.version.id, number: data.version.version } : null
+  });
+}
+async function reverify(ctx) {
+  const id = ctx.params["id"];
+  const loaded = await orgTx(ctx, async (tx) => {
+    const job = await tx.one("select * from compile_jobs where id = $1", [id]);
+    if (!job) throw notFound("Compile job");
+    const spec = await tx.one("select * from specs where id = $1", [job.spec_id]);
+    if (!spec) throw notFound("Specification for this job");
+    const stored = await tx.one(
+      "select passed, sample_count, checks from verification_reports where job_id = $1",
+      [id]
+    );
+    return { job, spec, stored };
+  });
+  if (!loaded.stored) {
+    throw new ApiError(
+      "INVALID_REQUEST",
+      "This job has no verification report to re-check.",
+      loaded.job.status === "rejected" ? "The job was refused before compilation; submit a smaller specification instead." : "Only jobs that completed the pipeline can be re-verified.",
+      { jobId: id, status: loaded.job.status }
+    );
+  }
+  const kind = loaded.spec.kind;
+  const budget = parseBudget(loaded.spec.budgets);
+  const report = withCompilerErrors(() => {
+    const trace = new TraceRecorder();
+    const module = parseSpec({ kind, source: loaded.spec.source, name: loaded.spec.name }, trace);
+    const { circuit } = lowerToReversible(module, trace);
+    return verify(module, circuit, estimate(circuit), {
+      budget,
+      compilerVersion: COMPILER_VERSION,
+      specHash: loaded.job.spec_hash,
+      sampleCount: loaded.stored.sample_count ?? void 0,
+      seed: Number(loaded.job.seed),
+      trace
+    });
+  });
+  const before = new Map(loaded.stored.checks.map((c) => [c.id, c]));
+  const divergence = report.checks.filter((c) => before.get(c.id)?.status !== c.status || before.get(c.id)?.summary !== c.summary).map((c) => ({ id: c.id, storedStatus: before.get(c.id)?.status ?? null, currentStatus: c.status, summary: c.summary }));
+  const reproduced = report.passed === loaded.stored.passed && divergence.length === 0;
+  await orgTx(ctx, async (tx) => {
+    await recordEvent(tx, ctx.principal.orgId, id, loaded.job.status, loaded.job.status, {
+      reverified: true,
+      reproduced,
+      storedCompilerVersion: loaded.job.compiler_version,
+      compilerVersion: COMPILER_VERSION
+    });
+    await audit(tx, ctx.principal, {
+      action: "compile.reverify",
+      resourceType: "compile_job",
+      resourceId: id,
+      ip: ctx.ip,
+      userAgent: ctx.userAgent,
+      metadata: { reproduced, passed: report.passed }
+    });
+  });
+  return ok({
+    jobId: id,
+    reproduced,
+    storedPassed: loaded.stored.passed,
+    storedCompilerVersion: loaded.job.compiler_version,
+    compilerVersion: COMPILER_VERSION,
+    divergence,
+    verification: reportView(report)
+  });
+}
+async function exportArtifact(ctx) {
+  const id = ctx.params["id"];
+  const resolved = await orgTx(ctx, async (tx) => {
+    const artifact = await tx.one(
+      "select * from artifacts where id = $1",
+      [id]
+    );
+    if (!artifact) throw notFound("Artifact");
+    const authorizing2 = await tx.one(
+      `select j.id as job_id, j.spec_hash
+         from compile_job_artifacts ja
+         join compile_jobs j on j.id = ja.job_id
+         join verification_reports vr on vr.job_id = j.id
+        where ja.artifact_id = $1 and vr.passed
+        order by j.started_at limit 1`,
+      [id]
+    );
+    return { artifact, authorizing: authorizing2 };
+  });
+  if (!resolved.authorizing) {
+    throw new ApiError(
+      "VERIFICATION_REQUIRED",
+      "This artifact has not passed verification and cannot be exported.",
+      "Open the compile job to see which check failed, correct the specification, and compile again.",
+      { artifactId: id, kind: resolved.artifact.kind }
+    );
+  }
+  const authorizing = resolved.authorizing;
+  const content = await read(resolved.artifact.storage_uri);
+  await orgTx(
+    ctx,
+    (tx) => audit(tx, ctx.principal, {
+      action: "artifact.export",
+      resourceType: "artifact",
+      resourceId: id,
+      ip: ctx.ip,
+      userAgent: ctx.userAgent,
+      metadata: { kind: resolved.artifact.kind, contentHash: resolved.artifact.content_hash, jobId: authorizing.job_id }
+    })
+  );
+  return ok({
+    artifact: {
+      id: resolved.artifact.id,
+      kind: resolved.artifact.kind,
+      contentHash: resolved.artifact.content_hash,
+      sizeBytes: resolved.artifact.size_bytes,
+      createdAt: resolved.artifact.created_at
+    },
+    verifiedBy: { jobId: authorizing.job_id, specHash: authorizing.spec_hash },
+    content
+  });
+}
+var compileRoutes = [
+  { method: "POST", path: "/v1/compile", auth: "compile:run", rateLimit: "compile", idempotent: true, handler: run2 },
+  { method: "POST", path: "/v1/compile/estimate", auth: "compile:run", rateLimit: "compile", handler: estimate2 },
+  { method: "GET", path: "/v1/compile", auth: "compile:read", handler: list5 },
+  { method: "GET", path: "/v1/compile/:id", auth: "compile:read", handler: get2 },
+  { method: "POST", path: "/v1/compile/:id/verify", auth: "compile:run", rateLimit: "compile", handler: reverify },
+  { method: "GET", path: "/v1/artifacts/:id", auth: "artifact:read", handler: exportArtifact }
+];
+
 // functions/api/src/handler.ts
 var VERSION = process.env["QSYNTH_VERSION"] ?? "dev";
 var ROUTES = [
   ...authRoutes,
   ...projectRoutes,
+  ...compileRoutes,
   ...memberRoutes,
   ...apiKeyRoutes,
   ...auditRoutes,

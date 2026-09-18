@@ -29,10 +29,18 @@ export type ErrorCode =
   | 'VERIFICATION_REQUIRED'
   | 'SPEC_TOO_LARGE'
   // compilation (surfaced from @qsynth/core)
+  //
+  // These mirror QsynthErrorCode one-for-one rather than collapsing into a single
+  // COMPILE_FAILED, so a client can tell "your syntax is wrong" from "your design does
+  // not fit the budget you declared" from "the circuit does not implement your spec"
+  // without parsing prose. `fromCompiler` in routes/compile.ts relies on the names
+  // matching exactly.
   | 'COMPILE_FAILED'
   | 'PARSE_ERROR'
   | 'UNSUPPORTED_CONSTRUCT'
+  | 'INVALID_SPEC'
   | 'BUDGET_EXCEEDED'
+  | 'VERIFICATION_FAILED'
   // catch-all
   | 'INTERNAL';
 
@@ -55,7 +63,9 @@ const STATUS: Record<ErrorCode, number> = {
   COMPILE_FAILED: 422,
   PARSE_ERROR: 422,
   UNSUPPORTED_CONSTRUCT: 422,
+  INVALID_SPEC: 422,
   BUDGET_EXCEEDED: 422,
+  VERIFICATION_FAILED: 422,
   INTERNAL: 500,
 };
 

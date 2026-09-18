@@ -34,6 +34,28 @@ const MATRIX: Case[] = [
   { label: 'update project', method: 'PATCH', path: `/v1/projects/${ABSENT}`, body: { name: 'x' }, allowed: ['owner', 'admin', 'developer'] },
   { label: 'delete project', method: 'DELETE', path: `/v1/projects/${ABSENT}`, allowed: ['owner', 'admin'] },
 
+  // Compiling costs CPU and creates artifacts, so it sits with the write permissions;
+  // reading a report and exporting a verified artifact are available to viewers, who are
+  // exactly the people (reviewers, auditors) who need to read a verdict without running one.
+  { label: 'list compile jobs', method: 'GET', path: '/v1/compile', allowed: ['owner', 'admin', 'developer', 'viewer'] },
+  { label: 'read compile job', method: 'GET', path: `/v1/compile/${ABSENT}`, allowed: ['owner', 'admin', 'developer', 'viewer'] },
+  {
+    label: 'run a compile',
+    method: 'POST',
+    path: '/v1/compile',
+    body: { projectId: ABSENT, kind: 'boolean', source: 'in a, b\nout = a AND b' },
+    allowed: ['owner', 'admin', 'developer'],
+  },
+  {
+    label: 'estimate a compile',
+    method: 'POST',
+    path: '/v1/compile/estimate',
+    body: { kind: 'boolean', source: 'in a, b\nout = a AND b' },
+    allowed: ['owner', 'admin', 'developer'],
+  },
+  { label: 're-verify a job', method: 'POST', path: `/v1/compile/${ABSENT}/verify`, body: {}, allowed: ['owner', 'admin', 'developer'] },
+  { label: 'export an artifact', method: 'GET', path: `/v1/artifacts/${ABSENT}`, allowed: ['owner', 'admin', 'developer', 'viewer'] },
+
   { label: 'read organization', method: 'GET', path: '/v1/organization', allowed: ['owner', 'admin', 'developer', 'viewer'] },
   { label: 'rename organization', method: 'PATCH', path: '/v1/organization', body: { name: 'Renamed by authz probe' }, allowed: ['owner'] },
 

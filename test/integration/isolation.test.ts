@@ -135,6 +135,69 @@ describe('org context selection', () => {
   });
 });
 
+/**
+ * Compilation produces the most sensitive objects in the system — a verified circuit is
+ * the customer's design — and it produces them across four tables plus object storage.
+ * Each of those is a separate chance to forget the tenant boundary, so each is probed.
+ */
+describe('cross-tenant compilation and export', () => {
+  let betaJob: string;
+  let betaArtifact: string;
+
+  beforeAll(async () => {
+    const res = await call('POST', '/v1/compile', {
+      auth: { token: beta.token },
+      body: { projectId: betaProject, kind: 'boolean', source: 'in a, b\nout = a AND b', name: 'beta_secret' },
+    });
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    betaJob = res.body.job.id;
+    betaArtifact = res.body.artifacts.find((a: { kind: string }) => a.kind === 'qasm3').id;
+  });
+
+  it('does not leak another org\'s compile jobs in a list', async () => {
+    const res = await call('GET', '/v1/compile', { auth: { token: alpha.token } });
+    expect(res.status).toBe(200);
+    expect(res.body.jobs.map((j: { id: string }) => j.id)).not.toContain(betaJob);
+  });
+
+  it('does not leak them when the other org\'s project is named explicitly', async () => {
+    const res = await call('GET', `/v1/compile?projectId=${betaProject}`, { auth: { token: alpha.token } });
+    expect(res.status).toBe(200);
+    expect(res.body.jobs).toHaveLength(0);
+  });
+
+  it('refuses a targeted read of another org\'s job, and with it the specification text', async () => {
+    const res = await call('GET', `/v1/compile/${betaJob}`, { auth: { token: alpha.token } });
+    expect(res.status).toBe(404);
+    expect(JSON.stringify(res.body)).not.toContain('beta_secret');
+  });
+
+  it('refuses to export another org\'s verified artifact', async () => {
+    // The artifact passed verification — for its own org. The gate is not the only thing
+    // standing here; tenancy is checked first, so the answer is "no such artifact".
+    const res = await call('GET', `/v1/artifacts/${betaArtifact}`, { auth: { token: alpha.token } });
+    expect(res.status).toBe(404);
+    expect(res.body).not.toHaveProperty('content');
+
+    const owner = await call('GET', `/v1/artifacts/${betaArtifact}`, { auth: { token: beta.token } });
+    expect(owner.status).toBe(200);
+  });
+
+  it('refuses to re-verify another org\'s job', async () => {
+    const res = await call('POST', `/v1/compile/${betaJob}/verify`, { auth: { token: alpha.token }, body: {} });
+    expect(res.status).toBe(404);
+  });
+
+  it('refuses to compile into another org\'s project', async () => {
+    const res = await call('POST', '/v1/compile', {
+      auth: { token: alpha.token },
+      body: { projectId: betaProject, kind: 'boolean', source: 'in a\nout = NOT a' },
+    });
+    expect(res.status).toBe(404);
+    expect(errorCode(res)).toBe('NOT_FOUND');
+  });
+});
+
 describe('credential handling', () => {
   it('rejects every non-public route without a token', async () => {
     const routes: Array<[string, string]> = [
@@ -150,6 +213,11 @@ describe('credential handling', () => {
       ['GET', '/v1/api-keys'],
       ['POST', '/v1/api-keys'],
       ['GET', '/v1/audit-logs'],
+      ['GET', '/v1/compile'],
+      ['POST', '/v1/compile'],
+      ['POST', '/v1/compile/estimate'],
+      ['GET', `/v1/compile/${alphaProject}`],
+      ['GET', `/v1/artifacts/${alphaProject}`],
       ['GET', '/v1/auth/me'],
       ['POST', '/v1/auth/logout'],
     ];

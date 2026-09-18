@@ -13,12 +13,14 @@ import { projectRoutes } from './routes/projects.js';
 import { memberRoutes } from './routes/members.js';
 import { apiKeyRoutes } from './routes/apikeys.js';
 import { auditRoutes } from './routes/audit.js';
+import { compileRoutes } from './routes/compile.js';
 
 const VERSION = process.env['QSYNTH_VERSION'] ?? 'dev';
 
 const ROUTES: readonly Route[] = [
   ...authRoutes,
   ...projectRoutes,
+  ...compileRoutes,
   ...memberRoutes,
   ...apiKeyRoutes,
   ...auditRoutes,
