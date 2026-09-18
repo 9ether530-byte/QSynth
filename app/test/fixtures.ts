@@ -87,13 +87,30 @@ export const verification: VerificationView = {
   durationMs: 5,
   compilerVersion: '1.0.0',
   optimization: {
+    guard: { mode: 'exhaustive', checked: 4, space: 4 },
     passes: [
-      { pass: 'cancel-adjacent', outcome: 'applied', before: 5, after: 4 },
-      { pass: 'merge-controls', outcome: 'no_change', before: 4, after: 4 },
+      {
+        id: 'cancel-inverses',
+        title: 'Cancel self-inverse pairs',
+        status: 'applied',
+        summary: 'Cancel self-inverse pairs removed 1 gate.',
+        before: { qubits: 4, gates: 5, depth: 5 },
+        after: { qubits: 4, gates: 4, depth: 4 },
+        durationMs: 0.05,
+      },
+      {
+        id: 'constant-fold',
+        title: 'Fold constant controls',
+        status: 'no_change',
+        summary: 'Fold constant controls found nothing to rewrite.',
+        before: { qubits: 4, gates: 4, depth: 4 },
+        after: { qubits: 4, gates: 4, depth: 4 },
+        durationMs: 0.04,
+      },
     ],
-    gatesBefore: 5,
-    gatesAfter: 4,
     discarded: 0,
+    before: { qubits: 4, gates: 5, depth: 5 },
+    after: { qubits: 4, gates: 4, depth: 4 },
   },
 };
 

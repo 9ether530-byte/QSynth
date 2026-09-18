@@ -88,7 +88,13 @@ export function VerificationSection({ verification }: { verification: Verificati
           <FieldList>
             <Field
               label="Gates"
-              value={`${number(verification.optimization.gatesBefore)} → ${number(verification.optimization.gatesAfter)}`}
+              value={`${number(verification.optimization.before.gates)} → ${number(verification.optimization.after.gates)}`}
+            />
+            <Field
+              label="Guard"
+              value={`${verification.optimization.guard.mode} · ${number(verification.optimization.guard.checked)}/${number(
+                verification.optimization.guard.space,
+              )} assignments`}
             />
             {verification.optimization.discarded > 0 ? (
               <Field
@@ -99,14 +105,17 @@ export function VerificationSection({ verification }: { verification: Verificati
           </FieldList>
           <ul className="m-0 list-none p-0">
             {verification.optimization.passes.map((pass) => (
-              <li key={pass.pass} className="flex items-baseline justify-between gap-3 px-3 py-1 font-mono text-xs">
-                <span className="text-ink-dim">{pass.pass}</span>
+              <li key={pass.id} className="flex items-baseline justify-between gap-3 px-3 py-1 font-mono text-xs">
+                <span className="text-ink-dim" title={pass.summary}>
+                  {pass.title}
+                </span>
                 <span
                   className={
-                    pass.outcome === 'discarded' ? 'text-warning' : pass.outcome === 'applied' ? 'text-verified' : 'text-ink-faint'
+                    pass.status === 'discarded' ? 'text-warning' : pass.status === 'applied' ? 'text-verified' : 'text-ink-faint'
                   }
                 >
-                  {pass.outcome} {pass.before} → {pass.after}
+                  {pass.status === 'no_change' ? 'no change' : pass.status}
+                  {pass.before.gates === pass.after.gates ? '' : ` ${pass.before.gates} → ${pass.after.gates}`}
                 </span>
               </li>
             ))}

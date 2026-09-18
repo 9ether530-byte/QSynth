@@ -118,6 +118,8 @@ describe('the workbench', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Compile and verify' }));
 
     await waitFor(() => expect(screen.getAllByText('verified').length).toBeGreaterThan(0));
-    expect(screen.getByText(/exhaustive · 4\/4 assignments/)).toBeTruthy();
+    // The check's own coverage line. The optimizer's guard reports its coverage in the
+    // same words a row below, which is why this is pinned to the paragraph.
+    expect(screen.getByText(/exhaustive · 4\/4 assignments/, { selector: 'p' })).toBeTruthy();
   });
 });

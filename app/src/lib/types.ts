@@ -23,7 +23,9 @@ export interface Coverage {
   readonly mode: 'exhaustive' | 'sampled';
   readonly checked: number;
   readonly space: number;
-  readonly dontCare: number;
+  /** Absent on the optimizer's guard coverage, which has no notion of don't-care rows. */
+  readonly dontCare?: number;
+  readonly seed?: number;
 }
 
 export interface Counterexample {
@@ -43,19 +45,36 @@ export interface CheckResult {
   readonly evidence?: Record<string, unknown>;
 }
 
+/** The three figures a pass can move. Mirrors `CircuitShape` in the core package. */
+export interface CircuitShape {
+  readonly qubits: number;
+  readonly gates: number;
+  readonly depth: number;
+}
+
 export interface PassOutcome {
-  readonly pass: string;
-  readonly outcome: 'applied' | 'no_change' | 'discarded';
-  readonly before: number;
-  readonly after: number;
-  readonly reason?: string;
+  readonly id: string;
+  readonly title: string;
+  readonly status: 'applied' | 'no_change' | 'discarded';
+  readonly summary: string;
+  readonly before: CircuitShape;
+  readonly after: CircuitShape;
+  readonly durationMs: number;
+  readonly divergence?: {
+    readonly assignment: number;
+    readonly inputs: Record<string, number>;
+    readonly expected: Record<string, number>;
+    readonly observed: Record<string, number>;
+    readonly detail: string;
+  };
 }
 
 export interface OptimizationSummary {
+  readonly guard: Coverage;
   readonly passes: readonly PassOutcome[];
-  readonly gatesBefore: number;
-  readonly gatesAfter: number;
   readonly discarded: number;
+  readonly before: CircuitShape;
+  readonly after: CircuitShape;
 }
 
 export interface VerificationView {
