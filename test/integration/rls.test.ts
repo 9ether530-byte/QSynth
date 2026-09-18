@@ -161,6 +161,66 @@ suite('row level security', () => {
     expect(count).toBe(0);
   });
 
+  /**
+   * The check that keeps working as the schema grows. Every one of the tests above
+   * names a table by hand, so a table added in a later phase without a policy would
+   * pass all of them. This one asks the catalog instead: carrying `org_id` is the
+   * definition of tenant data, and tenant data without FORCE and a policy is a leak
+   * waiting for the first handler that forgets a where clause.
+   */
+  it('has FORCE row level security and a policy on every table carrying org_id', async () => {
+    const gaps = await pool.query(`
+      select c.relname,
+             c.relrowsecurity as enabled,
+             c.relforcerowsecurity as forced,
+             (select count(*) from pg_policy p where p.polrelid = c.oid)::int as policies
+        from pg_class c
+        join pg_namespace n on n.oid = c.relnamespace
+       where n.nspname = 'public' and c.relkind = 'r'
+         and exists (
+           select 1 from information_schema.columns col
+            where col.table_schema = 'public' and col.table_name = c.relname
+              and col.column_name = 'org_id')
+         and not (c.relrowsecurity and c.relforcerowsecurity and
+                  exists (select 1 from pg_policy p where p.polrelid = c.oid))
+       order by c.relname`);
+    expect(gaps.rows).toEqual([]);
+  });
+
+  it('hides another org\'s compilation history, reports and artifacts', async () => {
+    // Written as the owner role so the rows genuinely exist; the question is reachability.
+    const spec = await pool.query(
+      `insert into specs (org_id, project_id, name, kind, source, content_hash)
+       values ($1, $2, 'rls secret', 'boolean', 'out = a AND b', 'rls-probe-hash') returning id`,
+      [org.b.orgId, org.b.projectId],
+    );
+    const job = await pool.query(
+      `insert into compile_jobs (org_id, project_id, spec_id, spec_hash, status, seed, compiler_version)
+       values ($1, $2, $3, 'rls-probe-hash', 'succeeded', 1, 'test') returning id`,
+      [org.b.orgId, org.b.projectId, spec.rows[0].id],
+    );
+    const artifact = await pool.query(
+      `insert into artifacts (org_id, kind, content_hash, storage_uri, size_bytes)
+       values ($1, 'qasm3', 'rls-probe-artifact', 's3://nowhere/rls', 1) returning id`,
+      [org.b.orgId],
+    );
+    await pool.query(
+      `insert into verification_reports (org_id, job_id, passed, method, seed, checks)
+       values ($1, $2, true, 'exhaustive', 1, '[]'::jsonb)`,
+      [org.b.orgId, job.rows[0].id],
+    );
+
+    const seen = await asApp({ orgId: org.a.orgId, userId: org.a.userId }, async (c) => ({
+      specs: (await c.query('select id from specs where id = $1', [spec.rows[0].id])).rowCount,
+      jobs: (await c.query('select id from compile_jobs where id = $1', [job.rows[0].id])).rowCount,
+      artifacts: (await c.query('select id from artifacts where id = $1', [artifact.rows[0].id])).rowCount,
+      // The export gate reads this row. If RLS let it through, a passing verdict from
+      // another tenant could authorize releasing an artifact.
+      reports: (await c.query('select id from verification_reports where job_id = $1', [job.rows[0].id])).rowCount,
+    }));
+    expect(seen).toEqual({ specs: 0, jobs: 0, artifacts: 0, reports: 0 });
+  });
+
   it('hides another org\'s users and organizations', async () => {
     const seen = await asApp({ orgId: org.a.orgId, userId: org.a.userId }, async (c) => {
       const users = await c.query('select id from users where id = $1', [org.b.userId]);
