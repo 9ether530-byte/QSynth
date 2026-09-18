@@ -1,0 +1,234 @@
+@import 'tailwindcss';
+
+/**
+ * "Laboratory instrument": a dark ground, hairline rules instead of shadows, and an 8 px
+ * grid. The palette is three accents and a lot of grey, because on this screen colour is
+ * carrying meaning — verified, unoptimized, failed — and a page that uses colour
+ * decoratively spends the signal it needs for that.
+ *
+ * Every accent is also paired with an icon and a word wherever it appears (see
+ * `components/Status.tsx`). The colours below are chosen to stay separable under
+ * deuteranopia and protanopia, but separable is not the same as legible, and a user who
+ * cannot see the difference must still be able to read the verdict.
+ */
+@theme {
+  --color-ground: #0b0d10;
+  --color-panel: #101317;
+  --color-raised: #161a20;
+  --color-rule: #232830;
+  --color-rule-strong: #333a45;
+
+  --color-ink: #e8ecf1;
+  --color-ink-dim: #9aa4b2;
+  --color-ink-faint: #6b7686;
+
+  --color-verified: #22d3ee;
+  --color-warning: #f59e0b;
+  --color-failed: #fb7185;
+
+  --font-display: 'Space Grotesk', ui-sans-serif, system-ui, sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+
+  --radius-none: 0px;
+}
+
+@layer base {
+  html {
+    background-color: var(--color-ground);
+    color: var(--color-ink);
+    font-family: var(--font-display);
+    /* The grid is 8 px; 15px/24px keeps body text on it without fractional line boxes. */
+    font-size: 15px;
+    line-height: 24px;
+  }
+
+  body {
+    margin: 0;
+    min-height: 100vh;
+  }
+
+  code,
+  pre,
+  kbd,
+  samp {
+    font-family: var(--font-mono);
+  }
+
+  /* Focus is never removed, only restyled — this is an instrument people drive from the
+     keyboard, and an invisible focus ring makes that impossible. */
+  :focus-visible {
+    outline: 2px solid var(--color-verified);
+    outline-offset: 2px;
+  }
+
+  ::selection {
+    background: color-mix(in srgb, var(--color-verified) 30%, transparent);
+  }
+
+  /* Respect the user's setting rather than animating regardless. The only motion in the
+     app is the stage progress indicator, which conveys state and so degrades to a static
+     marker rather than disappearing. */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}
+
+@layer components {
+  .qs-rule {
+    border-color: var(--color-rule);
+  }
+
+  /* A panel: hairline border, flat fill, no shadow. Shadows imply depth this interface
+     does not have. */
+  .qs-panel {
+    background-color: var(--color-panel);
+    border: 1px solid var(--color-rule);
+  }
+
+  .qs-label {
+    font-size: 11px;
+    line-height: 16px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--color-ink-faint);
+  }
+
+  .qs-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    border: 1px solid var(--color-rule-strong);
+    background-color: var(--color-raised);
+    color: var(--color-ink);
+    padding: 6px 14px;
+    font-size: 14px;
+    line-height: 20px;
+    cursor: pointer;
+  }
+
+  .qs-btn:hover:not(:disabled) {
+    border-color: var(--color-verified);
+    color: var(--color-verified);
+  }
+
+  .qs-btn:disabled {
+    color: var(--color-ink-faint);
+    cursor: not-allowed;
+  }
+
+  .qs-btn-primary {
+    border-color: var(--color-verified);
+    color: var(--color-verified);
+  }
+
+  .qs-input {
+    background-color: var(--color-ground);
+    border: 1px solid var(--color-rule-strong);
+    color: var(--color-ink);
+    padding: 6px 10px;
+    font-family: var(--font-mono);
+    font-size: 14px;
+    line-height: 20px;
+    width: 100%;
+  }
+
+  .qs-input::placeholder {
+    color: var(--color-ink-faint);
+  }
+
+  .qs-link {
+    color: var(--color-verified);
+    text-decoration: underline;
+    text-underline-offset: 3px;
+  }
+}
+
+/* CodeMirror, dressed to match. The editor ships its own light theme by default, which
+   would be the one bright rectangle on the page. */
+.cm-editor {
+  background-color: var(--color-ground);
+  color: var(--color-ink);
+  height: 100%;
+  font-size: 13.5px;
+}
+
+.cm-editor .cm-scroller {
+  font-family: var(--font-mono);
+  line-height: 20px;
+}
+
+.cm-editor .cm-gutters {
+  background-color: var(--color-panel);
+  border-right: 1px solid var(--color-rule);
+  color: var(--color-ink-faint);
+}
+
+.cm-editor .cm-activeLine {
+  background-color: color-mix(in srgb, var(--color-raised) 60%, transparent);
+}
+
+.cm-editor .cm-activeLineGutter {
+  background-color: var(--color-raised);
+  color: var(--color-ink-dim);
+}
+
+.cm-editor .cm-cursor {
+  border-left-color: var(--color-verified);
+}
+
+.cm-editor .cm-selectionBackground,
+.cm-editor.cm-focused .cm-selectionBackground,
+.cm-editor ::selection {
+  background-color: color-mix(in srgb, var(--color-verified) 25%, transparent) !important;
+}
+
+/* The error marker. A squiggle alone would be colour-only signalling, so the gutter also
+   carries a glyph (see `editorLint` in components/SpecEditor.tsx). */
+.cm-editor .cm-lintRange-error {
+  background: none;
+  border-bottom: 2px solid var(--color-failed);
+}
+
+/* The gutter marker carries the glyph, so an error is legible without the colour. The
+   default lint marker is a coloured SVG dot; this replaces it with a character. */
+.cm-editor .cm-lint-marker-error,
+.cm-editor .cm-lint-marker-warning {
+  content: none;
+  background-image: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.cm-editor .cm-lint-marker-error::after {
+  content: '✕';
+  color: var(--color-failed);
+}
+
+.cm-editor .cm-lint-marker-warning::after {
+  content: '!';
+  color: var(--color-warning);
+}
+
+/* The line the diagram or the trace console is pointing at. A left bar as well as a tint,
+   because the tint alone is close to the active-line background. */
+.cm-editor .qs-cm-linked {
+  background-color: color-mix(in srgb, var(--color-verified) 12%, transparent);
+  box-shadow: inset 2px 0 0 var(--color-verified);
+}
+
+.cm-editor .cm-tooltip {
+  background-color: var(--color-raised);
+  border: 1px solid var(--color-rule-strong);
+  color: var(--color-ink);
+  font-family: var(--font-display);
+}

@@ -11,6 +11,8 @@
     "build": "npm run build:api && npm run build:migrate",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:app": "npm --prefix app run test",
+    "build:app": "npm --prefix app run build",
     "test:integration": "vitest run --config vitest.integration.config.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
