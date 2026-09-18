@@ -20,6 +20,8 @@ import { initialState, run, simulate } from '../sim/basisState.js';
 import type { ResourceBudget, ResourceEstimate } from '../estimate/resources.js';
 import { BUDGET_FIELDS } from '../estimate/resources.js';
 import { Rng } from '../util/rng.js';
+import type { QuantumCircuit } from '../ir/quantum.js';
+import { checkDecomposition } from './decomposition.js';
 import type { TraceRecorder } from '../trace/trace.js';
 import {
   buildReport,
@@ -37,6 +39,13 @@ export interface VerifyOptions {
   readonly budget?: ResourceBudget;
   readonly compilerVersion: string;
   readonly specHash: string;
+  /**
+   * The Clifford+T decomposition, when one has been produced. Check 2 verifies it
+   * alongside the reversible circuit: the artifact a user exports is the decomposed
+   * circuit, so a check that stopped at the reversible layer would be guaranteeing
+   * something other than what they run.
+   */
+  readonly quantum?: QuantumCircuit;
   /** Sample count when the input space is too large to enumerate. */
   readonly sampleCount?: number;
   readonly seed?: number;
@@ -231,17 +240,46 @@ function checkEquivalence(module: ClassicalModule, circuit: ReversibleCircuit, o
       ? `all ${coverage.checked} of ${coverage.space} input assignments`
       : `${coverage.checked} of ${coverage.space} input assignments sampled with seed ${coverage.seed}`;
 
+  if (counterexample) {
+    return {
+      id: 'simulation_equivalence',
+      title: CHECK_TITLES.simulation_equivalence,
+      status: 'failed',
+      summary: `The circuit disagrees with the specification on at least one input assignment (${describe(counterexample)}).`,
+      durationMs: now() - started,
+      coverage,
+      counterexample,
+    };
+  }
+
+  const matched =
+    `The circuit matches the specification on ${scope}` +
+    (coverage.dontCare > 0 ? `, with ${coverage.dontCare} unconstrained assignment(s) excluded.` : '.');
+
+  // The reversible circuit is right. Now: is the circuit we actually emit still it?
+  if (!options.quantum) {
+    return {
+      id: 'simulation_equivalence',
+      title: CHECK_TITLES.simulation_equivalence,
+      status: 'passed',
+      summary: matched,
+      durationMs: now() - started,
+      coverage,
+    };
+  }
+
+  const decomposition = checkDecomposition(circuit, options.quantum, { assignments: plan.assignments });
   return {
     id: 'simulation_equivalence',
     title: CHECK_TITLES.simulation_equivalence,
-    status: counterexample ? 'failed' : 'passed',
-    summary: counterexample
-      ? `The circuit disagrees with the specification on at least one input assignment (${describe(counterexample)}).`
-      : `The circuit matches the specification on ${scope}` +
-        (coverage.dontCare > 0 ? `, with ${coverage.dontCare} unconstrained assignment(s) excluded.` : '.'),
+    status: decomposition.ok ? 'passed' : 'failed',
+    summary: decomposition.ok
+      ? `${matched} ${decomposition.evidence.methodReason}`
+      : `The circuit matches the specification, but its Clifford+T decomposition does not match the circuit: ` +
+        `${decomposition.failure!.detail}`,
     durationMs: now() - started,
     coverage,
-    counterexample,
+    evidence: { decomposition: decomposition.evidence, ...(decomposition.failure ? { failure: decomposition.failure } : {}) },
   };
 }
 
@@ -440,10 +478,21 @@ function checkResources(estimate: ResourceEstimate, budget: ResourceBudget | und
     return skipped('resource', 'The specification declares no resource budgets, so there was nothing to enforce.');
   }
 
+  // Every comparison says where its number came from. A T-count budget failed against a
+  // figure read off a table is a different claim from one failed against a real
+  // decomposition, and the user is the one who has to tell them apart.
   const comparisons = declared.map((field) => {
     const limit = budget![field.key]!;
     const actual = field.actual(estimate);
-    return { budget: field.key, label: field.label, limit, actual, withinBudget: actual <= limit, projected: field.projected };
+    return {
+      budget: field.key,
+      label: field.label,
+      limit,
+      actual,
+      withinBudget: actual <= limit,
+      layer: field.layer,
+      source: field.layer === 'clifford+t' ? estimate.cliffordT.source : ('measured' as const),
+    };
   });
   const exceeded = comparisons.filter((c) => !c.withinBudget);
 

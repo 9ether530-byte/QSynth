@@ -1,5 +1,6 @@
 /**
- * The compile pipeline: source → Classical IR → Reversible IR → checks → OpenQASM.
+ * The compile pipeline: source → Classical IR → Reversible IR → Clifford+T → checks →
+ * OpenQASM.
  *
  * Two things this file is responsible for beyond sequencing.
  *
@@ -21,9 +22,11 @@ import { QsynthError, invalidSpec } from './errors.js';
 import { contentHash } from './hash.js';
 import { EXHAUSTIVE_INPUT_LIMIT, type ClassicalModule } from './ir/classical.js';
 import type { ReversibleCircuit } from './ir/reversible.js';
+import type { QuantumCircuit } from './ir/quantum.js';
 import { lowerBoolean } from './frontend/boolean/lower.js';
 import { lowerTruthTable } from './frontend/truthtable/lower.js';
 import { lowerToReversible } from './lowering/classicalToReversible.js';
+import { lowerToQuantum } from './lowering/reversibleToQuantum.js';
 import { estimate as estimateResources, projectGateCount, projectVerificationOps, type ResourceBudget, type ResourceEstimate } from './estimate/resources.js';
 import { emitQasm3, gateListText } from './emit/qasm3.js';
 import { verify } from './verify/checks.js';
@@ -44,7 +47,7 @@ export const SPEC_KINDS: readonly SpecKind[] = ['boolean', 'truthtable'];
  */
 export const MAX_VERIFICATION_OPS = 50_000_000;
 
-export type StageName = 'parse' | 'lower' | 'verify' | 'emit' | 'estimate';
+export type StageName = 'parse' | 'lower' | 'decompose' | 'estimate' | 'verify' | 'emit';
 
 export interface StageRecord {
   readonly stage: StageName;
@@ -65,6 +68,7 @@ export interface CompileRequest {
 export interface CompileResult {
   readonly module: ClassicalModule;
   readonly circuit: ReversibleCircuit;
+  readonly quantum: QuantumCircuit;
   readonly estimate: ResourceEstimate;
   readonly report: VerificationReport;
   readonly qasm: string;
@@ -89,7 +93,7 @@ export interface Preflight {
 }
 
 export function preflight(module: ClassicalModule): Preflight {
-  const projectedGates = projectGateCount(module.nodes.length);
+  const projectedGates = projectGateCount(module.nodes.length, module.outputs.length);
   const ops = projectVerificationOps(module.inputs.length, projectedGates, EXHAUSTIVE_INPUT_LIMIT);
   const accepted = ops <= MAX_VERIFICATION_OPS;
   return {
@@ -170,15 +174,20 @@ export function compile(request: CompileRequest): CompileResult {
 
   const { circuit } = stage('lower', () => lowerToReversible(module, trace));
 
+  // Decomposing before estimating is what turns the Clifford+T figures from a projection
+  // into a measurement — the budget check then runs against the circuit that gets emitted.
+  const quantum = stage('decompose', () => lowerToQuantum(circuit, trace));
+
   const resourceEstimate = stage('estimate', () => {
-    const value = estimateResources(circuit);
+    const value = estimateResources(circuit, quantum);
     trace.add({
       phase: 'estimate',
       kind: 'resources',
       message:
         `The circuit uses ${value.qubits} qubit(s) — ${value.inputQubits} input, ${value.ancillaQubits} ancilla, ` +
         `${value.outputQubits} output — with ${value.gateCount} reversible gates at depth ${value.depth}. ` +
-        `Decomposed to Clifford+T this is projected at ${value.projected.tCount} T gates, T-depth ${value.projected.tDepth}.`,
+        `Its Clifford+T decomposition has ${value.cliffordT.gateCount} gates, of which ${value.cliffordT.tCount} are T, ` +
+        `at T-depth ${value.cliffordT.tDepth} — counted off the decomposition, not projected.`,
       detail: { ...value },
     });
     return value;
@@ -191,17 +200,20 @@ export function compile(request: CompileRequest): CompileResult {
       specHash,
       sampleCount: request.sampleCount,
       seed: seedFromHash(specHash),
+      quantum,
       trace,
     }),
   );
 
   const qasm = stage('emit', () => {
-    const text = emitQasm3(circuit, { compilerVersion: COMPILER_VERSION, specHash });
+    const text = emitQasm3(quantum, { compilerVersion: COMPILER_VERSION, specHash });
     trace.add({
       phase: 'emit',
       kind: 'qasm',
-      message: `${circuit.gates.length} gate(s) were written as OpenQASM 3.0 using only gates from stdgates.inc.`,
-      detail: { bytes: text.length },
+      message:
+        `${quantum.gates.length} Clifford+T gate(s) were written as OpenQASM 3.0 using only gates from stdgates.inc. ` +
+        `The emitted circuit is the decomposition, so the file is the circuit that was verified.`,
+      detail: { bytes: text.length, gates: quantum.gates.length },
     });
     return text;
   });
@@ -209,6 +221,7 @@ export function compile(request: CompileRequest): CompileResult {
   return {
     module,
     circuit,
+    quantum,
     estimate: resourceEstimate,
     report,
     qasm,

@@ -14,6 +14,9 @@ import {
 
 const SPEC = 'in a, b, c\nout = (a AND b) XOR c';
 
+/** The nine gates the emitter is allowed to name. */
+const QASM_GATES = ['x', 'y', 'z', 'h', 's', 'sdg', 't', 'tdg', 'cx'];
+
 function compileOk(source: string, extra: Partial<Parameters<typeof compile>[0]> = {}): CompileResult {
   const result = compile({ kind: 'boolean', source, ...extra });
   expect(result.report.passed, JSON.stringify(result.report.checks.find((c) => c.status === 'failed'))).toBe(true);
@@ -31,7 +34,7 @@ describe('the pipeline', () => {
   });
 
   it('attributes time to each stage in order', () => {
-    expect(result.stages.map((s) => s.stage)).toEqual(['parse', 'lower', 'estimate', 'verify', 'emit']);
+    expect(result.stages.map((s) => s.stage)).toEqual(['parse', 'lower', 'decompose', 'estimate', 'verify', 'emit']);
     expect(result.stages.every((s) => s.status === 'passed')).toBe(true);
     expect(result.stages.every((s) => s.durationMs >= 0)).toBe(true);
   });
@@ -87,17 +90,24 @@ describe('OpenQASM emission', () => {
     expect(result.qasm).toContain(`bit[${result.circuit.outputs.length}] c;`);
   });
 
-  it('uses only gates from stdgates.inc', () => {
+  it('uses only Clifford+T gates from stdgates.inc', () => {
     const body = result.qasm
       .split('\n')
       .filter((line) => line && !line.startsWith('//') && !line.startsWith('OPENQASM') && !line.startsWith('include'));
     const used = new Set(body.map((line) => line.split(' ')[0]).filter((word) => word && !word.startsWith('qubit') && !word.startsWith('bit') && !word.startsWith('c[')));
-    expect([...used].every((gate) => ['x', 'cx', 'ccx', 'cswap'].includes(gate!))).toBe(true);
+    // Deliberately no `ccx` or `cswap`: those are convenience macros, not gates any
+    // fault-tolerant machine executes, and emitting one would hide the T cost the user
+    // is being charged for.
+    expect([...used].every((gate) => QASM_GATES.includes(gate!))).toBe(true);
+    expect([...used]).not.toContain('ccx');
   });
 
-  it('emits exactly one instruction per gate', () => {
-    const instructions = result.qasm.split('\n').filter((l) => /^(x|cx|ccx|cswap) /.test(l));
-    expect(instructions).toHaveLength(result.circuit.gates.length);
+  it('emits exactly one instruction per decomposed gate', () => {
+    const instructions = result.qasm.split('\n').filter((l) => new RegExp(`^(${QASM_GATES.join('|')}) `).test(l));
+    expect(instructions).toHaveLength(result.quantum.gates.length);
+    // And the decomposition is genuinely larger than the reversible circuit — otherwise
+    // this assertion could pass against a pipeline that never decomposed at all.
+    expect(result.quantum.gates.length).toBeGreaterThan(result.circuit.gates.length);
   });
 
   it('documents which wire is which', () => {
@@ -126,19 +136,20 @@ describe('resource estimates', () => {
     expect(inputQubits).toBe(3);
   });
 
-  it('projects T count from the per-gate table', () => {
+  it('counts T gates off the decomposition, and the table agrees with the count', () => {
     const toffolis = result.circuit.gates.filter((g) => g.kind === 'ccnot').length;
-    expect(result.estimate.projected.tCount).toBe(toffolis * GATE_COST.ccnot.t);
+    expect(result.estimate.cliffordT.source).toBe('measured');
+    expect(result.estimate.cliffordT.tCount).toBe(toffolis * GATE_COST.ccnot.t);
   });
 
   it('reports T-depth as a critical path, not a sum', () => {
-    const { tCount, tDepth } = result.estimate.projected;
+    const { tCount, tDepth } = result.estimate.cliffordT;
     expect(tDepth).toBeGreaterThan(0);
     expect(tDepth).toBeLessThanOrEqual(tCount);
   });
 
-  it('says which basis the projection assumes', () => {
-    expect(result.estimate.projected.basis).toContain('Clifford+T');
+  it('says which basis the figures are stated in', () => {
+    expect(result.estimate.cliffordT.basis).toContain('Clifford+T');
   });
 
   it('gives depth no greater than the gate count', () => {
@@ -194,8 +205,32 @@ describe('estimate-only path', () => {
     expect(result).not.toHaveProperty('report');
   });
 
-  it('agrees with the full compile on the numbers', () => {
-    expect(estimateOnly({ kind: 'boolean', source: SPEC }).estimate).toEqual(compileOk(SPEC).estimate);
+  it('agrees with the full compile on every reversible-layer figure', () => {
+    const { cliffordT: _fast, ...fast } = estimateOnly({ kind: 'boolean', source: SPEC }).estimate;
+    const { cliffordT: _full, ...full } = compileOk(SPEC).estimate;
+    expect(fast).toEqual(full);
+  });
+
+  /**
+   * This is the assertion that makes the fast path trustworthy enough to refuse a job on.
+   * The table in `estimate/resources.ts` is a *claim* about what the decomposer will do;
+   * here that claim is checked against what it actually did. If someone edits a rule and
+   * forgets the table, a budget refusal would start quoting a number the artifact does
+   * not have — and this test fails first.
+   */
+  it('projects the same T count, two-qubit count and gate count that the decomposition measures', () => {
+    const projected = estimateOnly({ kind: 'boolean', source: SPEC }).estimate.cliffordT;
+    const measured = compileOk(SPEC).estimate.cliffordT;
+    expect(projected.source).toBe('projected');
+    expect(measured.source).toBe('measured');
+    expect(projected.tCount).toBe(measured.tCount);
+    expect(projected.twoQubitGates).toBe(measured.twoQubitGates);
+    expect(projected.gateCount).toBe(measured.gateCount);
+    // T-depth is the one figure the table can only bound: it layers whole reversible
+    // gates, while the real decomposition layers individual T gates and can interleave
+    // two Toffolis that share only a control. Over-estimating is the safe direction —
+    // a projected refusal is never laxer than the measurement would have been.
+    expect(projected.tDepth).toBeGreaterThanOrEqual(measured.tDepth);
   });
 
   it('reports the pre-flight verdict rather than throwing, so the caller can advise', () => {

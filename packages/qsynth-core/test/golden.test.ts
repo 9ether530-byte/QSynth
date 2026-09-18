@@ -87,7 +87,7 @@ describe.each(CORPUS)('$name', (entry) => {
       '//',
       `// ${result.estimate.qubits} qubits (${result.estimate.inputQubits} in, ${result.estimate.ancillaQubits} ancilla, ` +
         `${result.estimate.outputQubits} out), ${result.estimate.gateCount} gates, depth ${result.estimate.depth}, ` +
-        `projected T count ${result.estimate.projected.tCount}.`,
+        `T count ${result.estimate.cliffordT.tCount}.`,
       '',
     ].join('\n');
     await expect(header + result.qasm).toMatchFileSnapshot(`./golden/${entry.name}.qasm`);

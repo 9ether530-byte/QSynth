@@ -63,21 +63,24 @@ describe('a specification that verifies', () => {
 
   it('attributes time to each pipeline stage rather than to the request as a whole', async () => {
     const res = await call('GET', `/v1/compile/${passingJob.id}`, { auth: { token: org.token } });
-    expect(res.body.stages.map((s: { stage: string }) => s.stage)).toEqual(['parse', 'lower', 'estimate', 'verify', 'emit']);
+    expect(res.body.stages.map((s: { stage: string }) => s.stage)).toEqual(['parse', 'lower', 'decompose', 'estimate', 'verify', 'emit']);
     for (const stage of res.body.stages) expect(stage.status).toBe('ok');
   });
 
-  it('keeps measured figures apart from Clifford+T projections', async () => {
+  it('keeps the reversible-layer figures apart from the Clifford+T ones, and says which were counted', async () => {
     const res = await call('GET', `/v1/compile/${passingJob.id}`, { auth: { token: org.token } });
     expect(res.body.resources.measured.qubits).toBeGreaterThan(0);
-    expect(res.body.resources.projected.tCount).toBeGreaterThan(0);
+    expect(res.body.resources.cliffordT.tCount).toBeGreaterThan(0);
     expect(res.body.resources.measured).not.toHaveProperty('tCount');
-    expect(res.body.resources.projected).not.toHaveProperty('qubits');
+    expect(res.body.resources.cliffordT).not.toHaveProperty('qubits');
+    // A full compile decomposes before estimating, so these are counted off the circuit
+    // that was emitted — not read off the per-gate table.
+    expect(res.body.resources.cliffordT.source).toBe('measured');
   });
 
-  it('stores the QASM, the reversible IR and the trace as separate artifacts', async () => {
+  it('stores both IR layers, the QASM and the trace as separate artifacts', async () => {
     const kinds = passingJob.artifacts.map((a) => a.kind).sort();
-    expect(kinds).toEqual(['qasm3', 'reversible_ir', 'trace']);
+    expect(kinds).toEqual(['qasm3', 'quantum_ir', 'reversible_ir', 'trace']);
   });
 });
 
@@ -176,6 +179,10 @@ describe('the estimate fast path', () => {
     expect(res.body.resources.measured.qubits).toBeGreaterThan(0);
     expect(res.body).not.toHaveProperty('artifacts');
     expect(res.body).not.toHaveProperty('qasm');
+    // This path stops before decomposing, so its Clifford+T figures are read off the
+    // per-gate table and have to say so — a T count the caller cannot reproduce from an
+    // artifact must not be presented as if it had been counted.
+    expect(res.body.resources.cliffordT.source).toBe('projected');
   });
 
   it('persists nothing — an unverified circuit leaves no artifact behind', async () => {

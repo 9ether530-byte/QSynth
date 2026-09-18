@@ -2077,10 +2077,10 @@ function lowerTable(table, options = {}) {
   let memoHits = 0;
   const build = (level, pattern) => {
     const key = `${level}:${pattern}`;
-    const cached = memo.get(key);
-    if (cached !== void 0) {
+    const cached2 = memo.get(key);
+    if (cached2 !== void 0) {
       memoHits++;
-      return cached;
+      return cached2;
     }
     let id;
     if (!pattern.includes("1")) {
@@ -2129,6 +2129,69 @@ function lowerTable(table, options = {}) {
   });
   return builder.build();
 }
+
+// packages/qsynth-core/src/ir/quantum.ts
+var QUANTUM_ARITY = {
+  x: 1,
+  y: 1,
+  z: 1,
+  h: 1,
+  s: 1,
+  sdg: 1,
+  t: 1,
+  tdg: 1,
+  cx: 2
+};
+var NON_CLIFFORD = /* @__PURE__ */ new Set(["t", "tdg"]);
+function isClifford(circuit) {
+  return !circuit.gates.some((g) => NON_CLIFFORD.has(g.kind));
+}
+function tCount(circuit) {
+  return circuit.gates.reduce((n, g) => n + (NON_CLIFFORD.has(g.kind) ? 1 : 0), 0);
+}
+function twoQubitCount(circuit) {
+  return circuit.gates.reduce((n, g) => n + (g.wires.length > 1 ? 1 : 0), 0);
+}
+function tDepth(circuit) {
+  const ready = new Int32Array(circuit.wires.length);
+  const tLayers = /* @__PURE__ */ new Set();
+  for (const gate of circuit.gates) {
+    let layer = 0;
+    for (const w of gate.wires) layer = Math.max(layer, ready[w]);
+    for (const w of gate.wires) ready[w] = layer + 1;
+    if (NON_CLIFFORD.has(gate.kind)) tLayers.add(layer);
+  }
+  return tLayers.size;
+}
+var QuantumBuilder = class {
+  constructor(name, wires, inputs, outputs) {
+    this.name = name;
+    this.wires = wires;
+    this.inputs = inputs;
+    this.outputs = outputs;
+  }
+  name;
+  wires;
+  inputs;
+  outputs;
+  gates = [];
+  emit(kind, wires, opts = {}) {
+    assertInvariant(wires.length === QUANTUM_ARITY[kind], `${kind} takes ${QUANTUM_ARITY[kind]} qubit(s), got ${wires.length}`);
+    assertInvariant(new Set(wires).size === wires.length, `${kind} names the same qubit twice`);
+    for (const w of wires) assertInvariant(w >= 0 && w < this.wires.length, `gate references undeclared qubit ${w}`);
+    this.gates.push({ kind, wires: [...wires], source: opts.source, span: opts.span });
+  }
+  build() {
+    return {
+      name: this.name,
+      wires: [...this.wires],
+      gates: [...this.gates],
+      inputs: [...this.inputs],
+      outputs: [...this.outputs],
+      basis: "clifford+t"
+    };
+  }
+};
 
 // packages/qsynth-core/src/lowering/classicalToReversible.ts
 function lowerToReversible(module, trace) {
@@ -2305,6 +2368,344 @@ function describe2(module, node) {
   return `intermediate ${node.op} at node ${node.id}`;
 }
 
+// packages/qsynth-core/src/sim/statevector.ts
+var MAX_STATEVECTOR_QUBITS = 20;
+var SQRT1_2 = Math.SQRT1_2;
+var Statevector = class _Statevector {
+  qubits;
+  re;
+  im;
+  constructor(qubits) {
+    if (qubits > MAX_STATEVECTOR_QUBITS) {
+      throw new QsynthError(
+        "BUDGET_EXCEEDED",
+        `Statevector simulation needs 2^${qubits} amplitudes; the limit is 2^${MAX_STATEVECTOR_QUBITS}.`,
+        "Verification of wider circuits runs at the reversible layer, which does not build a statevector.",
+        { details: { qubits, limit: MAX_STATEVECTOR_QUBITS } }
+      );
+    }
+    this.qubits = qubits;
+    this.re = new Float64Array(1 << qubits);
+    this.im = new Float64Array(1 << qubits);
+  }
+  /** |index⟩ — a computational basis state. */
+  static basis(qubits, index) {
+    const state = new _Statevector(qubits);
+    state.re[index] = 1;
+    return state;
+  }
+  get size() {
+    return this.re.length;
+  }
+  amplitude(index) {
+    return { re: this.re[index], im: this.im[index] };
+  }
+  probability(index) {
+    const re = this.re[index];
+    const im = this.im[index];
+    return re * re + im * im;
+  }
+  /** The basis index carrying (essentially) all the probability, or null if none does. */
+  dominantBasis(tolerance = 1e-9) {
+    for (let i = 0; i < this.re.length; i++) {
+      if (this.probability(i) > 1 - tolerance) return i;
+    }
+    return null;
+  }
+  apply(kind, wires) {
+    if (kind === "cx") {
+      this.applyCx(wires[0], wires[1]);
+      return;
+    }
+    this.applySingle(kind, wires[0]);
+  }
+  run(circuit) {
+    for (const gate of circuit.gates) this.apply(gate.kind, gate.wires);
+  }
+  /**
+   * Single-qubit gates are split into three shapes rather than run through one general
+   * 2×2 multiply. X is a swap, the diagonal gates touch only the |1⟩ half, and only H
+   * actually mixes amplitudes — writing them separately keeps the common cases free of
+   * multiplications by zero.
+   */
+  applySingle(kind, qubit) {
+    const stride = 1 << qubit;
+    const { re, im } = this;
+    for (let base = 0; base < re.length; base += stride << 1) {
+      for (let offset = 0; offset < stride; offset++) {
+        const i0 = base + offset;
+        const i1 = i0 + stride;
+        switch (kind) {
+          case "x": {
+            const r = re[i0], m = im[i0];
+            re[i0] = re[i1];
+            im[i0] = im[i1];
+            re[i1] = r;
+            im[i1] = m;
+            break;
+          }
+          case "y": {
+            const r0 = re[i0], m0 = im[i0], r1 = re[i1], m1 = im[i1];
+            re[i0] = m1;
+            im[i0] = -r1;
+            re[i1] = -m0;
+            im[i1] = r0;
+            break;
+          }
+          case "z": {
+            re[i1] = -re[i1];
+            im[i1] = -im[i1];
+            break;
+          }
+          case "s": {
+            const r = re[i1];
+            re[i1] = -im[i1];
+            im[i1] = r;
+            break;
+          }
+          case "sdg": {
+            const r = re[i1];
+            re[i1] = im[i1];
+            im[i1] = -r;
+            break;
+          }
+          case "t": {
+            const r = re[i1], m = im[i1];
+            re[i1] = SQRT1_2 * (r - m);
+            im[i1] = SQRT1_2 * (r + m);
+            break;
+          }
+          case "tdg": {
+            const r = re[i1], m = im[i1];
+            re[i1] = SQRT1_2 * (r + m);
+            im[i1] = SQRT1_2 * (m - r);
+            break;
+          }
+          case "h": {
+            const r0 = re[i0], m0 = im[i0], r1 = re[i1], m1 = im[i1];
+            re[i0] = SQRT1_2 * (r0 + r1);
+            im[i0] = SQRT1_2 * (m0 + m1);
+            re[i1] = SQRT1_2 * (r0 - r1);
+            im[i1] = SQRT1_2 * (m0 - m1);
+            break;
+          }
+          case "cx":
+            break;
+        }
+      }
+    }
+  }
+  applyCx(control, target) {
+    const cBit = 1 << control;
+    const tBit = 1 << target;
+    const { re, im } = this;
+    for (let i = 0; i < re.length; i++) {
+      if ((i & cBit) === 0 || (i & tBit) !== 0) continue;
+      const j = i | tBit;
+      const r = re[i], m = im[i];
+      re[i] = re[j];
+      im[i] = im[j];
+      re[j] = r;
+      im[j] = m;
+    }
+  }
+};
+var MAX_UNITARY_QUBITS = 6;
+function circuitUnitary(qubits, gates) {
+  if (qubits > MAX_UNITARY_QUBITS) {
+    throw new QsynthError(
+      "BUDGET_EXCEEDED",
+      `Building a unitary needs a 2^${qubits} \xD7 2^${qubits} matrix; the limit is ${MAX_UNITARY_QUBITS} qubits.`,
+      "Compare circuits by simulating basis states instead of by materialising the matrix.",
+      { details: { qubits, limit: MAX_UNITARY_QUBITS } }
+    );
+  }
+  const dim = 1 << qubits;
+  const re = new Float64Array(dim * dim);
+  const im = new Float64Array(dim * dim);
+  for (let col = 0; col < dim; col++) {
+    const state = Statevector.basis(qubits, col);
+    for (const gate of gates) state.apply(gate.kind, gate.wires);
+    re.set(state.re, col * dim);
+    im.set(state.im, col * dim);
+  }
+  return { qubits, dim, re, im };
+}
+function differsUpToGlobalPhase(expected, observed, tolerance = 1e-9) {
+  if (expected.dim !== observed.dim) {
+    return {
+      row: -1,
+      col: -1,
+      expected: { re: expected.dim, im: 0 },
+      observed: { re: observed.dim, im: 0 }
+    };
+  }
+  let anchor = -1;
+  let best = tolerance * tolerance;
+  for (let i = 0; i < expected.re.length; i++) {
+    const mag = expected.re[i] * expected.re[i] + expected.im[i] * expected.im[i];
+    if (mag > best) {
+      best = mag;
+      anchor = i;
+    }
+  }
+  if (anchor < 0) {
+    return { row: 0, col: 0, expected: { re: 0, im: 0 }, observed: { re: observed.re[0], im: observed.im[0] } };
+  }
+  const er0 = expected.re[anchor], ei0 = expected.im[anchor];
+  const or0 = observed.re[anchor], oi0 = observed.im[anchor];
+  const phaseRe = (or0 * er0 + oi0 * ei0) / best;
+  const phaseIm = (oi0 * er0 - or0 * ei0) / best;
+  for (let i = 0; i < expected.re.length; i++) {
+    const er = expected.re[i], ei = expected.im[i];
+    const wantRe = er * phaseRe - ei * phaseIm;
+    const wantIm = er * phaseIm + ei * phaseRe;
+    if (Math.abs(wantRe - observed.re[i]) > tolerance || Math.abs(wantIm - observed.im[i]) > tolerance) {
+      return {
+        row: i % expected.dim,
+        col: Math.floor(i / expected.dim),
+        expected: { re: wantRe, im: wantIm },
+        observed: { re: observed.re[i], im: observed.im[i] }
+      };
+    }
+  }
+  return null;
+}
+function permutationUnitary(qubits, image) {
+  const dim = 1 << qubits;
+  const re = new Float64Array(dim * dim);
+  const im = new Float64Array(dim * dim);
+  for (let col = 0; col < dim; col++) re[col * dim + image[col]] = 1;
+  return { qubits, dim, re, im };
+}
+
+// packages/qsynth-core/src/lowering/reversibleToQuantum.ts
+var TOFFOLI = [
+  { kind: "h", wires: [2] },
+  { kind: "cx", wires: [1, 2] },
+  { kind: "tdg", wires: [2] },
+  { kind: "cx", wires: [0, 2] },
+  { kind: "t", wires: [2] },
+  { kind: "cx", wires: [1, 2] },
+  { kind: "tdg", wires: [2] },
+  { kind: "cx", wires: [0, 2] },
+  { kind: "t", wires: [1] },
+  { kind: "t", wires: [2] },
+  { kind: "cx", wires: [0, 1] },
+  { kind: "h", wires: [2] },
+  { kind: "t", wires: [0] },
+  { kind: "tdg", wires: [1] },
+  { kind: "cx", wires: [0, 1] }
+];
+var FREDKIN = [
+  { kind: "cx", wires: [2, 1] },
+  ...TOFFOLI.map((g) => ({ kind: g.kind, wires: g.wires })),
+  { kind: "cx", wires: [2, 1] }
+];
+var RULES = [
+  { kind: "x", qubits: 1, image: [1, 0], replacement: [{ kind: "x", wires: [0] }], note: "X is already in the gate set." },
+  {
+    kind: "cnot",
+    qubits: 2,
+    image: [0, 3, 2, 1],
+    replacement: [{ kind: "cx", wires: [0, 1] }],
+    note: "CNOT is already in the gate set."
+  },
+  {
+    kind: "ccnot",
+    qubits: 3,
+    image: [0, 1, 2, 7, 4, 5, 6, 3],
+    replacement: TOFFOLI,
+    note: "Toffoli \u2192 2 H, 6 CNOT, 7 T (T-depth 5 as sequenced here)."
+  },
+  {
+    kind: "cswap",
+    qubits: 3,
+    image: [0, 1, 2, 5, 4, 3, 6, 7],
+    replacement: FREDKIN,
+    note: "Fredkin \u2192 CNOT \xB7 Toffoli \xB7 CNOT: 2 H, 8 CNOT, 7 T (T-depth 5 as sequenced here)."
+  }
+];
+var RULE_BY_KIND = Object.fromEntries(
+  RULES.map((rule) => [rule.kind, rule])
+);
+var cached;
+function verifyRules() {
+  if (cached) return cached;
+  const rules = RULES.map((rule) => {
+    const expected = permutationUnitary(rule.qubits, rule.image);
+    const observed = circuitUnitary(rule.qubits, rule.replacement);
+    const difference = differsUpToGlobalPhase(expected, observed);
+    return {
+      kind: rule.kind,
+      qubits: rule.qubits,
+      gates: rule.replacement.length,
+      tCount: rule.replacement.filter((g) => g.kind === "t" || g.kind === "tdg").length,
+      ok: difference === null,
+      note: rule.note,
+      ...difference ? { difference } : {}
+    };
+  });
+  cached = { ok: rules.every((r) => r.ok), rules };
+  return cached;
+}
+function lowerToQuantum(circuit, trace) {
+  const verdicts = verifyRules();
+  if (!verdicts.ok) {
+    const broken = verdicts.rules.filter((r) => !r.ok).map((r) => r.kind);
+    throw new QsynthError(
+      "INTERNAL",
+      `The Clifford+T decomposition rule for ${broken.join(", ")} does not match the gate it replaces.`,
+      "This is a compiler defect. Please report it with the specification that triggered it.",
+      { details: { rules: verdicts.rules } }
+    );
+  }
+  const builder = new QuantumBuilder(circuit.name, circuit.wires, circuit.inputs, circuit.outputs);
+  const perKind = {};
+  circuit.gates.forEach((gate, index) => {
+    const rule = RULE_BY_KIND[gate.kind];
+    perKind[gate.kind] = (perKind[gate.kind] ?? 0) + 1;
+    for (const local of rule.replacement) {
+      builder.emit(
+        local.kind,
+        local.wires.map((w) => gate.wires[w]),
+        { source: index, span: gate.span }
+      );
+    }
+  });
+  const quantum = builder.build();
+  trace?.add({
+    phase: "reversible",
+    kind: "decompose.rules",
+    message: `All ${verdicts.rules.length} decomposition rules were checked against the exact matrix of the gate they replace before use, so the Clifford+T circuit is equivalent to the reversible one by construction.`,
+    detail: { rules: verdicts.rules.map((r) => ({ kind: r.kind, gates: r.gates, tCount: r.tCount, ok: r.ok })) }
+  });
+  for (const rule of RULES) {
+    const used = perKind[rule.kind];
+    if (!used) continue;
+    trace?.add({
+      phase: "reversible",
+      kind: "decompose.gate",
+      message: `${used} ${LABEL[rule.kind]} gate(s) were decomposed into ${used * rule.replacement.length} Clifford+T gate(s), contributing ${used * ruleTCount(rule)} T gate(s). ${rule.note}`,
+      detail: { kind: rule.kind, count: used, gatesEach: rule.replacement.length, tEach: ruleTCount(rule) }
+    });
+  }
+  return quantum;
+}
+function ruleTCount(rule) {
+  return rule.replacement.filter((g) => g.kind === "t" || g.kind === "tdg").length;
+}
+var LABEL = { x: "NOT", cnot: "CNOT", ccnot: "Toffoli", cswap: "Fredkin" };
+function asQuantumDirect(circuit) {
+  const builder = new QuantumBuilder(circuit.name, circuit.wires, circuit.inputs, circuit.outputs);
+  for (const [index, gate] of circuit.gates.entries()) {
+    if (gate.kind === "x") builder.emit("x", gate.wires, { source: index });
+    else if (gate.kind === "cnot") builder.emit("cx", gate.wires, { source: index });
+    else return null;
+  }
+  return builder.build();
+}
+
 // packages/qsynth-core/src/sim/basisState.ts
 function zeroState(circuit) {
   return new Uint8Array(circuit.wires.length);
@@ -2362,37 +2763,317 @@ function simulate(circuit, inputBits) {
   };
 }
 
+// packages/qsynth-core/src/sim/stabilizer.ts
+var MAX_STABILIZER_QUBITS = 1024;
+var Tableau = class _Tableau {
+  n;
+  /** Row-major, (2n) rows × n columns. */
+  x;
+  z;
+  r;
+  constructor(n) {
+    if (n > MAX_STABILIZER_QUBITS) {
+      throw new QsynthError(
+        "BUDGET_EXCEEDED",
+        `Stabilizer simulation of ${n} qubits exceeds the limit of ${MAX_STABILIZER_QUBITS}.`,
+        "Split the design into modules that are verified separately.",
+        { details: { qubits: n, limit: MAX_STABILIZER_QUBITS } }
+      );
+    }
+    this.n = n;
+    this.x = new Uint8Array(2 * n * n);
+    this.z = new Uint8Array(2 * n * n);
+    this.r = new Uint8Array(2 * n);
+  }
+  /** The identity: row i holds Xᵢ for i < n, and Z_{i-n} above that. */
+  static identity(n) {
+    const tableau = new _Tableau(n);
+    for (let i = 0; i < n; i++) {
+      tableau.x[i * n + i] = 1;
+      tableau.z[(n + i) * n + i] = 1;
+    }
+    return tableau;
+  }
+  apply(kind, wires) {
+    switch (kind) {
+      case "h":
+        this.hadamard(wires[0]);
+        return;
+      case "s":
+        this.phase(wires[0]);
+        return;
+      case "sdg":
+        this.phase(wires[0]);
+        this.phase(wires[0]);
+        this.phase(wires[0]);
+        return;
+      case "z":
+        this.phase(wires[0]);
+        this.phase(wires[0]);
+        return;
+      case "x":
+        this.hadamard(wires[0]);
+        this.phase(wires[0]);
+        this.phase(wires[0]);
+        this.hadamard(wires[0]);
+        return;
+      case "y":
+        this.apply("z", wires);
+        this.apply("x", wires);
+        return;
+      case "cx":
+        this.cnot(wires[0], wires[1]);
+        return;
+      case "t":
+      case "tdg":
+        throw new QsynthError(
+          "INTERNAL",
+          "A T gate was handed to the stabilizer simulator, which can only represent Clifford operations.",
+          "This is a compiler defect: the caller should have checked the circuit is Clifford first.",
+          { details: { gate: kind } }
+        );
+    }
+  }
+  run(circuit) {
+    for (const gate of circuit.gates) this.apply(gate.kind, gate.wires);
+  }
+  hadamard(a) {
+    const { n, x, z, r } = this;
+    for (let i = 0; i < 2 * n; i++) {
+      const k = i * n + a;
+      r[i] = r[i] ^ x[k] & z[k];
+      const t = x[k];
+      x[k] = z[k];
+      z[k] = t;
+    }
+  }
+  phase(a) {
+    const { n, x, z, r } = this;
+    for (let i = 0; i < 2 * n; i++) {
+      const k = i * n + a;
+      r[i] = r[i] ^ x[k] & z[k];
+      z[k] = z[k] ^ x[k];
+    }
+  }
+  cnot(a, b) {
+    const { n, x, z, r } = this;
+    for (let i = 0; i < 2 * n; i++) {
+      const ka = i * n + a;
+      const kb = i * n + b;
+      r[i] = r[i] ^ x[ka] & z[kb] & (x[kb] ^ z[ka] ^ 1);
+      x[kb] = x[kb] ^ x[ka];
+      z[ka] = z[ka] ^ z[kb];
+    }
+  }
+  /** Every bit of the tableau, for an exact comparison between two circuits. */
+  equals(other) {
+    if (this.n !== other.n) return false;
+    for (let i = 0; i < this.x.length; i++) {
+      if (this.x[i] !== other.x[i] || this.z[i] !== other.z[i]) return false;
+    }
+    for (let i = 0; i < this.r.length; i++) if (this.r[i] !== other.r[i]) return false;
+    return true;
+  }
+  /** The first row where two tableaux disagree, as readable Pauli strings. */
+  firstDifference(other) {
+    for (let i = 0; i < 2 * this.n; i++) {
+      for (let q = 0; q < this.n; q++) {
+        const k = i * this.n + q;
+        if (this.x[k] === other.x[k] && this.z[k] === other.z[k]) continue;
+        return {
+          row: i,
+          role: i < this.n ? "destabilizer" : "stabilizer",
+          qubit: i % this.n,
+          expected: this.rowString(i),
+          observed: other.rowString(i)
+        };
+      }
+      if (this.r[i] !== other.r[i]) {
+        return {
+          row: i,
+          role: i < this.n ? "destabilizer" : "stabilizer",
+          qubit: i % this.n,
+          expected: this.rowString(i),
+          observed: other.rowString(i)
+        };
+      }
+    }
+    return null;
+  }
+  /** e.g. `-XIZ` — the signed Pauli string a generator is mapped to. */
+  rowString(row) {
+    const parts = [this.r[row] === 1 ? "-" : "+"];
+    for (let q = 0; q < this.n; q++) {
+      const k = row * this.n + q;
+      const xb = this.x[k];
+      const zb = this.z[k];
+      parts.push(xb && zb ? "Y" : xb ? "X" : zb ? "Z" : "I");
+    }
+    return parts.join("");
+  }
+};
+function cliffordEquivalent(a, b) {
+  for (const circuit of [a, b]) {
+    const offending = circuit.gates.find((g) => NON_CLIFFORD.has(g.kind));
+    if (offending) {
+      throw new QsynthError(
+        "INTERNAL",
+        `Circuit "${circuit.name}" contains a ${offending.kind} gate and is not Clifford.`,
+        "This is a compiler defect: check `isClifford` before comparing tableaux.",
+        { details: { gate: offending.kind } }
+      );
+    }
+  }
+  const qubits = Math.max(a.wires.length, b.wires.length);
+  const left = Tableau.identity(qubits);
+  const right = Tableau.identity(qubits);
+  left.run(a);
+  right.run(b);
+  const difference = left.firstDifference(right);
+  if (!difference) return { equivalent: true, qubits };
+  return {
+    equivalent: false,
+    qubits,
+    difference: {
+      generator: `${difference.role === "destabilizer" ? "X" : "Z"}${difference.qubit}`,
+      expected: difference.expected,
+      observed: difference.observed
+    }
+  };
+}
+
+// packages/qsynth-core/src/verify/decomposition.ts
+var STATEVECTOR_SAMPLES = 8;
+function checkDecomposition(circuit, quantum, options = {}) {
+  const verdicts = verifyRules();
+  const base = {
+    rulesVerified: verdicts.ok,
+    rules: verdicts.rules.map((r) => ({ kind: r.kind, gates: r.gates, tCount: r.tCount, ok: r.ok })),
+    qubits: quantum.wires.length,
+    tCount: tCount(quantum),
+    twoQubitGates: twoQubitCount(quantum),
+    gateCount: quantum.gates.length
+  };
+  if (!verdicts.ok) {
+    const broken = verdicts.rules.filter((r) => !r.ok);
+    return {
+      ok: false,
+      evidence: { ...base, method: "rules_only", methodReason: "The rule table failed its own check, so nothing further was run." },
+      failure: {
+        stage: "rules",
+        detail: `The decomposition rule for ${broken.map((r) => r.kind).join(", ")} does not equal the gate it replaces.`
+      }
+    };
+  }
+  if (isClifford(quantum)) {
+    const reference = asQuantumDirect(circuit);
+    if (reference) {
+      const comparison = cliffordEquivalent(reference, quantum);
+      const evidence = {
+        ...base,
+        method: "tableau",
+        methodReason: "The decomposition contains no T gates, so the circuit is Clifford and tableau comparison decides equivalence exactly."
+      };
+      if (comparison.equivalent) return { ok: true, evidence };
+      return {
+        ok: false,
+        evidence,
+        failure: {
+          stage: "tableau",
+          detail: `Conjugating ${comparison.difference.generator} gives ${comparison.difference.observed} after decomposition, but ${comparison.difference.expected} before it.`
+        }
+      };
+    }
+  }
+  if (quantum.wires.length > MAX_STATEVECTOR_QUBITS) {
+    return {
+      ok: true,
+      evidence: {
+        ...base,
+        method: "rules_only",
+        methodReason: `The circuit uses ${quantum.wires.length} qubits, past the ${MAX_STATEVECTOR_QUBITS}-qubit statevector limit, so equivalence rests on the verified rule table rather than on an end-to-end execution.`
+      }
+    };
+  }
+  const assignments = pick(circuit, options.assignments);
+  for (const assignment of assignments) {
+    const bits = assignmentToBits(assignment, circuit.inputs.length);
+    const start = initialState(circuit, bits);
+    const expected = run(circuit, start.slice());
+    const state = Statevector.basis(quantum.wires.length, indexOf(start));
+    state.run(quantum);
+    const observed = state.dominantBasis();
+    if (observed === null || observed !== indexOf(expected)) {
+      return {
+        ok: false,
+        evidence: {
+          ...base,
+          method: "statevector",
+          methodReason: "An end-to-end execution of the decomposed circuit disagreed with the reversible one.",
+          statesChecked: assignments.length
+        },
+        failure: {
+          stage: "statevector",
+          assignment,
+          detail: observed === null ? "The decomposed circuit left the qubits in a superposition, so it is not the permutation the reversible circuit is." : `On assignment ${assignment} the decomposed circuit produced basis state ${observed}, not ${indexOf(expected)}.`
+        }
+      };
+    }
+  }
+  return {
+    ok: true,
+    evidence: {
+      ...base,
+      method: "statevector",
+      methodReason: `Every rule was checked against the exact matrix of its gate, and ${assignments.length} input assignment(s) were additionally executed end to end on the decomposed circuit.`,
+      statesChecked: assignments.length
+    }
+  };
+}
+function indexOf(state) {
+  let index = 0;
+  for (let w = 0; w < state.length; w++) if (state[w] === 1) index += 2 ** w;
+  return index;
+}
+function pick(circuit, planned) {
+  const space = 2 ** circuit.inputs.length;
+  const pool2 = planned && planned.length > 0 ? planned : Array.from({ length: Math.min(space, STATEVECTOR_SAMPLES) }, (_, i) => i);
+  if (pool2.length <= STATEVECTOR_SAMPLES) return pool2;
+  const step = Math.floor(pool2.length / STATEVECTOR_SAMPLES);
+  return Array.from({ length: STATEVECTOR_SAMPLES }, (_, i) => pool2[i * step]);
+}
+
 // packages/qsynth-core/src/estimate/resources.ts
 var GATE_COST = {
   x: { t: 0, tDepth: 0, cnot: 0, gates: 1 },
   cnot: { t: 0, tDepth: 0, cnot: 1, gates: 1 },
-  ccnot: { t: 7, tDepth: 3, cnot: 6, gates: 15 },
-  cswap: { t: 7, tDepth: 3, cnot: 8, gates: 17 }
+  ccnot: { t: 7, tDepth: 5, cnot: 6, gates: 15 },
+  cswap: { t: 7, tDepth: 5, cnot: 8, gates: 17 }
 };
 var BUDGET_FIELDS = [
-  { key: "maxQubits", label: "qubits", actual: (e) => e.qubits, projected: false },
-  { key: "maxGates", label: "reversible gates", actual: (e) => e.gateCount, projected: false },
-  { key: "maxDepth", label: "circuit depth", actual: (e) => e.depth, projected: false },
-  { key: "maxTCount", label: "T count", actual: (e) => e.projected.tCount, projected: true },
-  { key: "maxTDepth", label: "T depth", actual: (e) => e.projected.tDepth, projected: true },
+  { key: "maxQubits", label: "qubits", actual: (e) => e.qubits, layer: "reversible" },
+  { key: "maxGates", label: "reversible gates", actual: (e) => e.gateCount, layer: "reversible" },
+  { key: "maxDepth", label: "circuit depth", actual: (e) => e.depth, layer: "reversible" },
+  { key: "maxTCount", label: "T count", actual: (e) => e.cliffordT.tCount, layer: "clifford+t" },
+  { key: "maxTDepth", label: "T depth", actual: (e) => e.cliffordT.tDepth, layer: "clifford+t" },
   {
     key: "maxTwoQubitGates",
     label: "two-qubit gates",
-    actual: (e) => e.projected.twoQubitGates,
-    projected: true
+    actual: (e) => e.cliffordT.twoQubitGates,
+    layer: "clifford+t"
   }
 ];
-function estimate(circuit) {
-  const gatesByKind = {};
+function estimate(circuit, quantum) {
+  const gatesByKind2 = {};
   let multiQubitGates = 0;
-  let tCount = 0;
+  let tCount2 = 0;
   let cnotCount = 0;
   let quantumGates = 0;
   for (const gate of circuit.gates) {
-    gatesByKind[gate.kind] = (gatesByKind[gate.kind] ?? 0) + 1;
+    gatesByKind2[gate.kind] = (gatesByKind2[gate.kind] ?? 0) + 1;
     if (MULTI_QUBIT.has(gate.kind)) multiQubitGates++;
     const cost = GATE_COST[gate.kind];
-    tCount += cost.t;
+    tCount2 += cost.t;
     cnotCount += cost.cnot;
     quantumGates += cost.gates;
   }
@@ -2402,11 +3083,19 @@ function estimate(circuit) {
     ancillaQubits: circuit.ancillas.length,
     outputQubits: circuit.outputs.length,
     gateCount: circuit.gates.length,
-    gatesByKind,
+    gatesByKind: gatesByKind2,
     multiQubitGates,
     depth: depth(circuit),
-    projected: {
-      tCount,
+    cliffordT: quantum ? {
+      source: "measured",
+      tCount: tCount(quantum),
+      tDepth: tDepth(quantum),
+      twoQubitGates: twoQubitCount(quantum),
+      gateCount: quantum.gates.length,
+      basis: "Clifford+T, counted off the emitted decomposition"
+    } : {
+      source: "projected",
+      tCount: tCount2,
       tDepth: projectedTDepth(circuit),
       twoQubitGates: cnotCount,
       gateCount: quantumGates,
@@ -2427,8 +3116,9 @@ function projectedTDepth(circuit) {
   }
   return maximum;
 }
-function projectGateCount(nodeCount) {
-  return nodeCount * 3 * 2;
+var MAX_GATES_PER_NODE = 4;
+function projectGateCount(nodeCount, outputCount) {
+  return nodeCount * MAX_GATES_PER_NODE * 2 + outputCount;
 }
 function projectVerificationOps(inputCount, projectedGates, exhaustiveLimit) {
   const runs = inputCount <= exhaustiveLimit ? 2 ** inputCount : 2 ** exhaustiveLimit;
@@ -2436,7 +3126,17 @@ function projectVerificationOps(inputCount, projectedGates, exhaustiveLimit) {
 }
 
 // packages/qsynth-core/src/emit/qasm3.ts
-var QASM_GATE = { x: "x", cnot: "cx", ccnot: "ccx", cswap: "cswap" };
+var QASM_GATE = {
+  x: "x",
+  y: "y",
+  z: "z",
+  h: "h",
+  s: "s",
+  sdg: "sdg",
+  t: "t",
+  tdg: "tdg",
+  cx: "cx"
+};
 function emitQasm3(circuit, options) {
   const lines = [];
   const measure = options.measure ?? true;
@@ -2445,6 +3145,7 @@ function emitQasm3(circuit, options) {
   lines.push("");
   lines.push(`// ${circuit.name} \u2014 generated by qsynth ${options.compilerVersion}`);
   lines.push(`// spec ${options.specHash}`);
+  lines.push(`// basis ${circuit.basis}: ${circuit.gates.length} gates, ${tCount(circuit)} T, T-depth ${tDepth(circuit)}`);
   lines.push("//");
   lines.push("// Wire map:");
   for (const wire of circuit.wires) {
@@ -2694,14 +3395,37 @@ function checkEquivalence(module, circuit, options) {
   }
   const { coverage } = plan;
   const scope = coverage.mode === "exhaustive" ? `all ${coverage.checked} of ${coverage.space} input assignments` : `${coverage.checked} of ${coverage.space} input assignments sampled with seed ${coverage.seed}`;
+  if (counterexample) {
+    return {
+      id: "simulation_equivalence",
+      title: CHECK_TITLES.simulation_equivalence,
+      status: "failed",
+      summary: `The circuit disagrees with the specification on at least one input assignment (${describe3(counterexample)}).`,
+      durationMs: now() - started,
+      coverage,
+      counterexample
+    };
+  }
+  const matched = `The circuit matches the specification on ${scope}` + (coverage.dontCare > 0 ? `, with ${coverage.dontCare} unconstrained assignment(s) excluded.` : ".");
+  if (!options.quantum) {
+    return {
+      id: "simulation_equivalence",
+      title: CHECK_TITLES.simulation_equivalence,
+      status: "passed",
+      summary: matched,
+      durationMs: now() - started,
+      coverage
+    };
+  }
+  const decomposition = checkDecomposition(circuit, options.quantum, { assignments: plan.assignments });
   return {
     id: "simulation_equivalence",
     title: CHECK_TITLES.simulation_equivalence,
-    status: counterexample ? "failed" : "passed",
-    summary: counterexample ? `The circuit disagrees with the specification on at least one input assignment (${describe3(counterexample)}).` : `The circuit matches the specification on ${scope}` + (coverage.dontCare > 0 ? `, with ${coverage.dontCare} unconstrained assignment(s) excluded.` : "."),
+    status: decomposition.ok ? "passed" : "failed",
+    summary: decomposition.ok ? `${matched} ${decomposition.evidence.methodReason}` : `The circuit matches the specification, but its Clifford+T decomposition does not match the circuit: ${decomposition.failure.detail}`,
     durationMs: now() - started,
     coverage,
-    counterexample
+    evidence: { decomposition: decomposition.evidence, ...decomposition.failure ? { failure: decomposition.failure } : {} }
   };
 }
 function describe3(cex) {
@@ -2852,7 +3576,15 @@ function checkResources(estimate3, budget) {
   const comparisons = declared.map((field) => {
     const limit = budget[field.key];
     const actual = field.actual(estimate3);
-    return { budget: field.key, label: field.label, limit, actual, withinBudget: actual <= limit, projected: field.projected };
+    return {
+      budget: field.key,
+      label: field.label,
+      limit,
+      actual,
+      withinBudget: actual <= limit,
+      layer: field.layer,
+      source: field.layer === "clifford+t" ? estimate3.cliffordT.source : "measured"
+    };
   });
   const exceeded = comparisons.filter((c) => !c.withinBudget);
   return {
@@ -2872,7 +3604,7 @@ function now() {
 var SPEC_KINDS = ["boolean", "truthtable"];
 var MAX_VERIFICATION_OPS = 5e7;
 function preflight(module) {
-  const projectedGates = projectGateCount(module.nodes.length);
+  const projectedGates = projectGateCount(module.nodes.length, module.outputs.length);
   const ops = projectVerificationOps(module.inputs.length, projectedGates, EXHAUSTIVE_INPUT_LIMIT);
   const accepted = ops <= MAX_VERIFICATION_OPS;
   return {
@@ -2941,12 +3673,13 @@ function compile(request) {
     return parsed;
   });
   const { circuit } = stage("lower", () => lowerToReversible(module, trace));
+  const quantum = stage("decompose", () => lowerToQuantum(circuit, trace));
   const resourceEstimate = stage("estimate", () => {
-    const value = estimate(circuit);
+    const value = estimate(circuit, quantum);
     trace.add({
       phase: "estimate",
       kind: "resources",
-      message: `The circuit uses ${value.qubits} qubit(s) \u2014 ${value.inputQubits} input, ${value.ancillaQubits} ancilla, ${value.outputQubits} output \u2014 with ${value.gateCount} reversible gates at depth ${value.depth}. Decomposed to Clifford+T this is projected at ${value.projected.tCount} T gates, T-depth ${value.projected.tDepth}.`,
+      message: `The circuit uses ${value.qubits} qubit(s) \u2014 ${value.inputQubits} input, ${value.ancillaQubits} ancilla, ${value.outputQubits} output \u2014 with ${value.gateCount} reversible gates at depth ${value.depth}. Its Clifford+T decomposition has ${value.cliffordT.gateCount} gates, of which ${value.cliffordT.tCount} are T, at T-depth ${value.cliffordT.tDepth} \u2014 counted off the decomposition, not projected.`,
       detail: { ...value }
     });
     return value;
@@ -2959,22 +3692,24 @@ function compile(request) {
       specHash,
       sampleCount: request.sampleCount,
       seed: seedFromHash(specHash),
+      quantum,
       trace
     })
   );
   const qasm = stage("emit", () => {
-    const text = emitQasm3(circuit, { compilerVersion: COMPILER_VERSION, specHash });
+    const text = emitQasm3(quantum, { compilerVersion: COMPILER_VERSION, specHash });
     trace.add({
       phase: "emit",
       kind: "qasm",
-      message: `${circuit.gates.length} gate(s) were written as OpenQASM 3.0 using only gates from stdgates.inc.`,
-      detail: { bytes: text.length }
+      message: `${quantum.gates.length} Clifford+T gate(s) were written as OpenQASM 3.0 using only gates from stdgates.inc. The emitted circuit is the decomposition, so the file is the circuit that was verified.`,
+      detail: { bytes: text.length, gates: quantum.gates.length }
     });
     return text;
   });
   return {
     module,
     circuit,
+    quantum,
     estimate: resourceEstimate,
     report,
     qasm,
@@ -3156,7 +3891,7 @@ var resourceView = (e) => ({
     multiQubitGates: e.multiQubitGates,
     depth: e.depth
   },
-  projected: e.projected
+  cliffordT: e.cliffordT
 });
 var reportView = (report) => ({
   passed: report.passed,
@@ -3212,6 +3947,11 @@ function uploads(result) {
   return [
     { kind: "qasm3", contentType: "text/plain; charset=utf-8", body: result.qasm },
     { kind: "reversible_ir", contentType: "application/json", body: JSON.stringify(result.circuit) },
+    // Both IR layers are kept. The QASM is emitted from the quantum circuit, so the
+    // reversible form is the only record of what the decomposition came from — and it is
+    // the layer the equivalence check ran at, which a reviewer re-checking the verdict
+    // needs in hand.
+    { kind: "quantum_ir", contentType: "application/json", body: JSON.stringify(result.quantum) },
     { kind: "trace", contentType: "application/json", body: JSON.stringify(result.trace) }
   ];
 }
@@ -3353,9 +4093,11 @@ async function run2(ctx) {
     await tx.query(
       `insert into resource_estimates (org_id, job_id, qubits, ancillas, depth, gate_count, two_qubit_count, t_count, t_depth)
        values ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-      // Measured: qubits, ancillas, depth, gate_count. Projected onto Clifford+T:
-      // two_qubit_count, t_count, t_depth. The API response labels which is which.
-      [orgId, jobId, e.qubits, e.ancillaQubits, e.depth, e.gateCount, e.projected.twoQubitGates, e.projected.tCount, e.projected.tDepth]
+      // Counted off the reversible circuit: qubits, ancillas, depth, gate_count. Counted
+      // off the Clifford+T decomposition this compile emitted: two_qubit_count, t_count,
+      // t_depth. Both are measurements here — the estimate fast path, which projects them
+      // from a table, never reaches this insert.
+      [orgId, jobId, e.qubits, e.ancillaQubits, e.depth, e.gateCount, e.cliffordT.twoQubitGates, e.cliffordT.tCount, e.cliffordT.tDepth]
     );
     const artifacts = await recordArtifacts(tx, orgId, jobId, stored);
     const version = await nextVersion(tx, orgId, specId, projectId, jobId);
@@ -3510,12 +4252,14 @@ async function reverify(ctx) {
     const trace = new TraceRecorder();
     const module = parseSpec({ kind, source: loaded.spec.source, name: loaded.spec.name }, trace);
     const { circuit } = lowerToReversible(module, trace);
-    return verify(module, circuit, estimate(circuit), {
+    const quantum = lowerToQuantum(circuit, trace);
+    return verify(module, circuit, estimate(circuit, quantum), {
       budget,
       compilerVersion: COMPILER_VERSION,
       specHash: loaded.job.spec_hash,
       sampleCount: loaded.stored.sample_count ?? void 0,
       seed: Number(loaded.job.seed),
+      quantum,
       trace
     });
   });

@@ -32,6 +32,7 @@ import {
   estimate as estimateResources,
   estimateOnly,
   lowerToReversible,
+  lowerToQuantum,
   parseSpec,
   preflight,
   seedFromHash,
@@ -187,9 +188,11 @@ const jobView = (j: JobRow) => ({
 });
 
 /**
- * Measured and projected figures are kept in separate objects. Flattening them would
- * invite reading a Clifford+T projection as if it had been counted, which is the one
- * misreading the estimate must not allow.
+ * Reversible-layer and Clifford+T figures are kept in separate objects, and the second
+ * carries its own `source`. Flattening them would invite reading a projection as if it
+ * had been counted — the one misreading the estimate must not allow. A full compile
+ * decomposes before estimating, so its Clifford+T figures say `measured`; the estimate
+ * fast path stops earlier and says `projected`.
  */
 const resourceView = (e: ResourceEstimate) => ({
   measured: {
@@ -202,7 +205,7 @@ const resourceView = (e: ResourceEstimate) => ({
     multiQubitGates: e.multiQubitGates,
     depth: e.depth,
   },
-  projected: e.projected,
+  cliffordT: e.cliffordT,
 });
 
 const reportView = (report: VerificationReport) => ({
@@ -286,7 +289,7 @@ async function upsertSpec(
 }
 
 interface ArtifactUpload {
-  readonly kind: 'qasm3' | 'reversible_ir' | 'trace';
+  readonly kind: 'qasm3' | 'reversible_ir' | 'quantum_ir' | 'trace';
   readonly contentType: string;
   readonly body: string;
 }
@@ -301,6 +304,11 @@ function uploads(result: CompileResult): readonly ArtifactUpload[] {
   return [
     { kind: 'qasm3', contentType: 'text/plain; charset=utf-8', body: result.qasm },
     { kind: 'reversible_ir', contentType: 'application/json', body: JSON.stringify(result.circuit) },
+    // Both IR layers are kept. The QASM is emitted from the quantum circuit, so the
+    // reversible form is the only record of what the decomposition came from — and it is
+    // the layer the equivalence check ran at, which a reviewer re-checking the verdict
+    // needs in hand.
+    { kind: 'quantum_ir', contentType: 'application/json', body: JSON.stringify(result.quantum) },
     { kind: 'trace', contentType: 'application/json', body: JSON.stringify(result.trace) },
   ];
 }
@@ -490,9 +498,11 @@ async function run(ctx: Ctx) {
     await tx.query(
       `insert into resource_estimates (org_id, job_id, qubits, ancillas, depth, gate_count, two_qubit_count, t_count, t_depth)
        values ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-      // Measured: qubits, ancillas, depth, gate_count. Projected onto Clifford+T:
-      // two_qubit_count, t_count, t_depth. The API response labels which is which.
-      [orgId, jobId, e.qubits, e.ancillaQubits, e.depth, e.gateCount, e.projected.twoQubitGates, e.projected.tCount, e.projected.tDepth],
+      // Counted off the reversible circuit: qubits, ancillas, depth, gate_count. Counted
+      // off the Clifford+T decomposition this compile emitted: two_qubit_count, t_count,
+      // t_depth. Both are measurements here — the estimate fast path, which projects them
+      // from a table, never reaches this insert.
+      [orgId, jobId, e.qubits, e.ancillaQubits, e.depth, e.gateCount, e.cliffordT.twoQubitGates, e.cliffordT.tCount, e.cliffordT.tDepth],
     );
 
     const artifacts = await recordArtifacts(tx, orgId, jobId, stored);
@@ -693,12 +703,18 @@ async function reverify(ctx: Ctx) {
     const trace = new TraceRecorder();
     const module = parseSpec({ kind, source: loaded.spec.source, name: loaded.spec.name }, trace);
     const { circuit } = lowerToReversible(module, trace);
-    return verify(module, circuit, estimateResources(circuit), {
+    // Re-verification has to rebuild every stage the original compile ran, decomposition
+    // included. Stopping at the reversible layer would re-check a different circuit than
+    // the one that was signed off, and every job would then report a divergence in check
+    // 2 that says nothing about the job.
+    const quantum = lowerToQuantum(circuit, trace);
+    return verify(module, circuit, estimateResources(circuit, quantum), {
       budget,
       compilerVersion: COMPILER_VERSION,
       specHash: loaded.job.spec_hash,
       sampleCount: loaded.stored!.sample_count ?? undefined,
       seed: Number(loaded.job.seed),
+      quantum,
       trace,
     });
   });

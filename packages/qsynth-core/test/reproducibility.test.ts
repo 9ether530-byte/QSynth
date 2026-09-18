@@ -22,6 +22,7 @@ import {
   estimate as estimateResources,
   lowerBoolean,
   lowerToReversible,
+  lowerToQuantum,
   seedFromHash,
   TraceRecorder,
   verify,
@@ -128,10 +129,12 @@ describe('re-verification of a stored artifact', () => {
     const trace = new TraceRecorder();
     const module = lowerBoolean(entry.source, { moduleName: entry.name, trace });
     const { circuit } = lowerToReversible(module, trace);
-    const report = verify(module, circuit, estimateResources(circuit), {
+    const quantum = lowerToQuantum(circuit, trace);
+    const report = verify(module, circuit, estimateResources(circuit, quantum), {
       compilerVersion: original.compilerVersion,
       specHash: original.specHash,
       seed: seedFromHash(original.specHash),
+      quantum,
     });
 
     expect(report.passed).toBe(original.report.passed);

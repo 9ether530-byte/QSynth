@@ -44,6 +44,16 @@ function statusOf(report: VerificationReport, id: string) {
   return report.checks.find((c) => c.id === id)!;
 }
 
+/** The shape check 6 records per declared budget. */
+interface Comparison {
+  readonly budget: string;
+  readonly limit: number;
+  readonly actual: number;
+  readonly withinBudget: boolean;
+  readonly layer: 'reversible' | 'clifford+t';
+  readonly source: 'measured' | 'projected';
+}
+
 /**
  * A two-input circuit built with a caller-supplied compute rule. Injecting a wrong rule
  * here is the closest thing to a real lowering bug a test can produce.
@@ -306,10 +316,25 @@ describe('check 6 — resource budgets', () => {
     });
   });
 
-  it('marks projected figures as projected, so a T-count budget is not mistaken for a measurement', () => {
+  it('marks a table-derived T count as projected, so it is not mistaken for a measurement', () => {
+    // `check` estimates without a decomposition, which is the estimate fast path's shape.
     const report = check(module, circuit, { maxTCount: 1 });
-    const comparisons = (statusOf(report, 'resource').evidence as { comparisons: { budget: string; projected: boolean }[] }).comparisons;
-    expect(comparisons[0]).toMatchObject({ budget: 'maxTCount', projected: true });
+    const comparisons = (statusOf(report, 'resource').evidence as { comparisons: Comparison[] }).comparisons;
+    expect(comparisons[0]).toMatchObject({ budget: 'maxTCount', layer: 'clifford+t', source: 'projected' });
+  });
+
+  it('marks the same figure as measured once a decomposition exists', () => {
+    // A full compile decomposes before estimating, so the identical budget comparison is
+    // now a claim about the emitted circuit rather than about a table.
+    const result = compile({ kind: 'boolean', source: 'out = a AND b AND c', name: 'm', budget: { maxTCount: 1 } });
+    const comparisons = (result.report.checks.find((c) => c.id === 'resource')!.evidence as { comparisons: Comparison[] }).comparisons;
+    expect(comparisons[0]).toMatchObject({ budget: 'maxTCount', layer: 'clifford+t', source: 'measured' });
+  });
+
+  it('marks reversible-layer budgets as measured whether or not anything was decomposed', () => {
+    const comparisons = (statusOf(check(module, circuit, { maxQubits: 4 }), 'resource').evidence as { comparisons: Comparison[] })
+      .comparisons;
+    expect(comparisons[0]).toMatchObject({ budget: 'maxQubits', layer: 'reversible', source: 'measured' });
   });
 
   it('passes when every declared budget is met, and ignores the ones not declared', () => {

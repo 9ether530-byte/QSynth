@@ -20,6 +20,8 @@ import {
   initialState,
   lowerBoolean,
   lowerToReversible,
+  MAX_GATES_PER_NODE,
+  projectGateCount,
   outputsByName,
   run,
   TraceRecorder,
@@ -186,7 +188,7 @@ describe('any specification the parser accepts', () => {
     );
   });
 
-  it('emits one QASM instruction per gate, and the same bytes every time', () => {
+  it('emits one QASM instruction per decomposed gate, and the same bytes every time', () => {
     fc.assert(
       fc.property(specArb, (spec) => {
         const source = sourceOf(spec);
@@ -194,8 +196,8 @@ describe('any specification the parser accepts', () => {
         const second = compile({ kind: 'boolean', source });
         expect(second.artifactHash).toBe(first.artifactHash);
         expect(second.qasm).toBe(first.qasm);
-        const instructions = first.qasm.split('\n').filter((l) => /^(x|cx|ccx|cswap) /.test(l));
-        expect(instructions).toHaveLength(first.circuit.gates.length);
+        const instructions = first.qasm.split('\n').filter((l) => /^(x|y|z|h|s|sdg|t|tdg|cx) /.test(l));
+        expect(instructions).toHaveLength(first.quantum.gates.length);
       }),
       RUNS,
     );
@@ -206,12 +208,43 @@ describe('any specification the parser accepts', () => {
       fc.property(specArb, (spec) => {
         const result = compile({ kind: 'boolean', source: sourceOf(spec) });
         const operations = result.module.nodes.filter((n) => n.op !== 'input').length;
-        // Compute + uncompute, at most three gates per operation each way, plus one
-        // copy-out CNOT per output. This is the bound `projectGateCount` promises the
-        // pre-flight check, so a lowering rule that outgrew it would be caught here.
-        expect(result.circuit.gates.length).toBeLessThanOrEqual(operations * 6 + result.module.outputs.length);
+        // Compute + uncompute, at most `MAX_GATES_PER_NODE` each way, plus one copy-out
+        // CNOT per output. NOR is the rule that sets the constant, at four gates.
+        expect(result.circuit.gates.length).toBeLessThanOrEqual(operations * MAX_GATES_PER_NODE * 2 + result.module.outputs.length);
       }),
       RUNS,
+    );
+  });
+
+  /**
+   * The pre-flight projection has to be an over-estimate or the refusal it gates is
+   * worthless: a specification projected under the ceiling but running over it is
+   * accepted and then times out, which is the one outcome `preflight` exists to prevent.
+   * The projection is computed from the node count alone, before any lowering happens, so
+   * nothing but a property test can hold it to the circuits that actually come out.
+   */
+  it('never projects fewer gates than lowering produces', () => {
+    fc.assert(
+      fc.property(specArb, (spec) => {
+        const result = compile({ kind: 'boolean', source: sourceOf(spec) });
+        const projected = projectGateCount(result.module.nodes.length, result.module.outputs.length);
+        expect(result.circuit.gates.length).toBeLessThanOrEqual(projected);
+      }),
+      RUNS,
+    );
+  });
+
+  /**
+   * A regression on the same bound, kept as a fixed case because the generator reaches it
+   * rarely: NOR chains are the densest thing the lowering produces, and a chain of them
+   * over two inputs is where an under-estimating projection first shows.
+   */
+  it('projects enough gates for a deep chain of the widest operator', () => {
+    let expression = 'a';
+    for (let i = 0; i < 12; i++) expression = `(${expression} NOR b)`;
+    const result = compile({ kind: 'boolean', source: `in a, b\nout = ${expression}` });
+    expect(result.circuit.gates.length).toBeLessThanOrEqual(
+      projectGateCount(result.module.nodes.length, result.module.outputs.length),
     );
   });
 });

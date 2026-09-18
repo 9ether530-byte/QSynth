@@ -18,8 +18,33 @@ export * from './frontend/boolean/lower.js';
 export * from './frontend/truthtable/parser.js';
 export * from './frontend/truthtable/lower.js';
 
+// Re-exported by name rather than with `*`: the quantum IR has its own `depth`,
+// `gateCount` and `gatesByKind`, and a star export would silently drop whichever lost
+// the collision with the reversible IR's.
+export {
+  QUANTUM_ARITY,
+  NON_CLIFFORD,
+  QuantumBuilder,
+  ADJOINT,
+  adjoint,
+  isClifford,
+  tCount,
+  tDepth,
+  twoQubitCount,
+  gateCount as quantumGateCount,
+  gatesByKind as quantumGatesByKind,
+  depth as quantumDepth,
+  type QuantumGateKind,
+  type QuantumGate,
+  type QuantumCircuit,
+} from './ir/quantum.js';
+
 export * from './lowering/classicalToReversible.js';
+export * from './lowering/reversibleToQuantum.js';
 export * from './sim/basisState.js';
+export * from './sim/statevector.js';
+export * from './sim/stabilizer.js';
+export * from './verify/decomposition.js';
 export * from './estimate/resources.js';
 export * from './emit/qasm3.js';
 export * from './verify/report.js';
