@@ -1157,7 +1157,13 @@ var QsynthError = class extends Error {
   }
 };
 var parseError = (message, hint, span) => new QsynthError("PARSE_ERROR", message, hint, { span });
-var invalidSpec = (message, hint, details = {}) => new QsynthError("INVALID_SPEC", message, hint, { details });
+var unsupported = (construct, supported, span) => new QsynthError(
+  "UNSUPPORTED_CONSTRUCT",
+  `${construct} is not supported.`,
+  `QSYNTH accepts: ${supported.join(", ")}.`,
+  { span, details: { construct, supported } }
+);
+var invalidSpec = (message, hint, details = {}, span) => new QsynthError("INVALID_SPEC", message, hint, { details, span });
 function assertInvariant(condition, what) {
   if (!condition) {
     throw new QsynthError(
@@ -2130,6 +2136,1473 @@ function lowerTable(table, options = {}) {
   return builder.build();
 }
 
+// packages/qsynth-core/src/frontend/python/lexer.ts
+var PY_KEYWORDS = /* @__PURE__ */ new Set([
+  "def",
+  "return",
+  "if",
+  "elif",
+  "else",
+  "for",
+  "in",
+  "range",
+  "assert",
+  "and",
+  "or",
+  "not",
+  "True",
+  "False",
+  "pass"
+]);
+var PY_RESERVED = /* @__PURE__ */ new Set([
+  "while",
+  "class",
+  "import",
+  "from",
+  "as",
+  "lambda",
+  "try",
+  "except",
+  "finally",
+  "with",
+  "yield",
+  "global",
+  "nonlocal",
+  "del",
+  "raise",
+  "async",
+  "await",
+  "match",
+  "case",
+  "is",
+  "None",
+  "break",
+  "continue"
+]);
+var OPERATORS = [
+  "**=",
+  "//=",
+  "<<=",
+  ">>=",
+  "**",
+  "//",
+  "->",
+  "==",
+  "!=",
+  "<=",
+  ">=",
+  "<<",
+  ">>",
+  "+=",
+  "-=",
+  "*=",
+  "/=",
+  "%=",
+  "&=",
+  "|=",
+  "^=",
+  "+",
+  "-",
+  "*",
+  "/",
+  "%",
+  "&",
+  "|",
+  "^",
+  "~",
+  "<",
+  ">",
+  "=",
+  "(",
+  ")",
+  "[",
+  "]",
+  "{",
+  "}",
+  ",",
+  ":",
+  ".",
+  "@",
+  ";"
+];
+var isDigit = (c) => c >= "0" && c <= "9";
+var isIdentStart2 = (c) => c >= "a" && c <= "z" || c >= "A" && c <= "Z" || c === "_";
+var isIdentPart2 = (c) => isIdentStart2(c) || isDigit(c);
+function tokenizePython(source) {
+  if (source.length > MAX_SOURCE_BYTES) {
+    throw new QsynthError(
+      "SPEC_TOO_LARGE",
+      `The specification is ${source.length} characters long; the limit is ${MAX_SOURCE_BYTES}.`,
+      "Split the design into smaller functions and compile them separately.",
+      { details: { length: source.length, limit: MAX_SOURCE_BYTES } }
+    );
+  }
+  const tokens = [];
+  const indents = [0];
+  let index = 0;
+  let line = 1;
+  let lineStart = 0;
+  let depth3 = 0;
+  let atLineStart = true;
+  const column = () => index - lineStart + 1;
+  const push = (kind, value, start, startLine, startColumn) => {
+    tokens.push({ kind, value, span: { start, end: index, line: startLine, column: startColumn } });
+  };
+  const here = () => ({ start: index, end: index + 1, line, column: column() });
+  const newline = () => {
+    const start = index;
+    const startColumn = column();
+    index++;
+    if (depth3 === 0) push("newline", "\n", start, line, startColumn);
+    line++;
+    lineStart = index;
+    atLineStart = depth3 === 0;
+  };
+  while (index < source.length) {
+    if (atLineStart) {
+      atLineStart = false;
+      const start2 = index;
+      let width = 0;
+      while (index < source.length) {
+        const c2 = source[index];
+        if (c2 === " ") {
+          width++;
+          index++;
+          continue;
+        }
+        if (c2 === "	") {
+          throw parseError(
+            "This line is indented with a tab.",
+            "Indent with spaces. A file that mixes tabs and spaces renders differently in different editors, so the block structure you see would not be the block structure that compiles.",
+            { start: index, end: index + 1, line, column: column() }
+          );
+        }
+        break;
+      }
+      const rest = source[index];
+      if (rest === void 0) break;
+      if (rest === "\n" || rest === "\r" || rest === "#") continue;
+      const top = indents[indents.length - 1];
+      if (width > top) {
+        indents.push(width);
+        push("indent", " ".repeat(width), start2, line, 1);
+      } else if (width < top) {
+        while (indents.length > 1 && width < indents[indents.length - 1]) {
+          indents.pop();
+          push("dedent", "", start2, line, 1);
+        }
+        if (width !== indents[indents.length - 1]) {
+          throw parseError(
+            `This line is indented ${width} space(s), which does not close any open block.`,
+            `The enclosing blocks start at column ${indents.map((n) => n + 1).join(", ")}. Line up the line with one of them.`,
+            { start: start2, end: index, line, column: 1 }
+          );
+        }
+      }
+      continue;
+    }
+    const c = source[index];
+    if (c === "\r") {
+      index++;
+      continue;
+    }
+    if (c === "\n") {
+      newline();
+      continue;
+    }
+    if (c === " ") {
+      index++;
+      continue;
+    }
+    if (c === "	") {
+      index++;
+      continue;
+    }
+    if (c === "#") {
+      while (index < source.length && source[index] !== "\n") index++;
+      continue;
+    }
+    if (c === "\\" && source[index + 1] === "\n") {
+      index += 2;
+      line++;
+      lineStart = index;
+      continue;
+    }
+    if (isDigit(c)) {
+      const start2 = index;
+      const startColumn2 = column();
+      if (c === "0" && (source[index + 1] === "b" || source[index + 1] === "x" || source[index + 1] === "o")) {
+        index += 2;
+        while (index < source.length && isIdentPart2(source[index])) index++;
+      } else {
+        while (index < source.length && (isDigit(source[index]) || source[index] === "_")) index++;
+        if (source[index] === "." || source[index] === "e" || source[index] === "E") {
+          throw parseError(
+            "Floating-point numbers are not supported.",
+            "Every value in a QSYNTH specification is a bit or a bounded unsigned integer.",
+            { start: start2, end: index + 1, line, column: startColumn2 }
+          );
+        }
+      }
+      push("number", source.slice(start2, index), start2, line, startColumn2);
+      continue;
+    }
+    if (isIdentStart2(c)) {
+      const start2 = index;
+      const startColumn2 = column();
+      while (index < source.length && isIdentPart2(source[index])) index++;
+      const text = source.slice(start2, index);
+      push(PY_KEYWORDS.has(text) || PY_RESERVED.has(text) ? "keyword" : "ident", text, start2, line, startColumn2);
+      continue;
+    }
+    if (c === '"' || c === "'") {
+      throw parseError(
+        "String literals are not supported.",
+        "A QSYNTH specification describes bits, so there is nothing a string could name. Use a comment if you meant to document the line.",
+        here()
+      );
+    }
+    const op = OPERATORS.find((candidate) => source.startsWith(candidate, index));
+    if (op === void 0) {
+      throw parseError(
+        `Unexpected character "${c}".`,
+        "The subset uses & | ^ ~ + - << >> and the comparison operators.",
+        here()
+      );
+    }
+    const start = index;
+    const startColumn = column();
+    if (op === "(" || op === "[" || op === "{") depth3++;
+    if (op === ")" || op === "]" || op === "}") depth3 = Math.max(0, depth3 - 1);
+    index += op.length;
+    push("op", op, start, line, startColumn);
+  }
+  if (tokens.length > 0 && tokens[tokens.length - 1].kind !== "newline") {
+    push("newline", "\n", index, line, column());
+  }
+  while (indents.length > 1) {
+    indents.pop();
+    push("dedent", "", index, line, 1);
+  }
+  push("eof", "", index, line, column());
+  return tokens;
+}
+
+// packages/qsynth-core/src/frontend/python/parser.ts
+var MAX_UINT_WIDTH = 16;
+var SUPPORTED = [
+  "def with bit and uintN parameters",
+  "assignment",
+  "if/elif/else",
+  "for over range() with constant bounds",
+  "assert",
+  "return",
+  "& | ^ ~ and or not",
+  "+ - << >>",
+  "== != < <= > >=",
+  "indexing and slicing"
+];
+var AUG_OPS = {
+  "&=": "&",
+  "|=": "|",
+  "^=": "^",
+  "+=": "+",
+  "-=": "-",
+  "<<=": "<<",
+  ">>=": ">>"
+};
+var CMP_OPS = /* @__PURE__ */ new Set(["==", "!=", "<", "<=", ">", ">="]);
+var REFUSED_OPS = {
+  "*": {
+    what: "Multiplication",
+    hint: "Multiplication expands to one adder per bit of the multiplier, which puts even small operands past the verification budget. Write the partial products with << and + if you need it."
+  },
+  "/": { what: "Division", hint: "There is no division in the subset. Use >> for a shift by a constant." },
+  "//": { what: "Floor division", hint: "Use >> for a shift by a constant." },
+  "%": { what: "The modulo operator", hint: "Mask with & instead: x % 8 is x & 7." },
+  "**": { what: "Exponentiation", hint: "Use << for a shift by a constant." },
+  "@": { what: "The decorator and matrix-multiply operator", hint: "" },
+  ";": { what: "Statements separated by a semicolon", hint: "Put each statement on its own line." }
+};
+function parsePython(source) {
+  const tokens = tokenizePython(source);
+  let position = 0;
+  const peek = () => tokens[position];
+  const next = () => tokens[position++];
+  const at = (kind, value) => {
+    const token = peek();
+    return token.kind === kind && (value === void 0 || token.value === value);
+  };
+  const accept = (kind, value) => at(kind, value) ? next() : null;
+  const expect = (kind, value, description) => {
+    if (!at(kind, value)) {
+      refuseIfKnown(peek());
+      throw parseError(`Expected ${description}, found ${describe2(peek())}.`, hintFor(peek()), peek().span);
+    }
+    return next();
+  };
+  const skipNewlines = () => {
+    while (at("newline")) next();
+  };
+  function refuseIfKnown(token) {
+    if (token.kind === "keyword" && PY_RESERVED.has(token.value)) {
+      throw unsupported(reservedDescription(token.value), SUPPORTED, token.span);
+    }
+    const refused = token.kind === "op" ? REFUSED_OPS[token.value] : void 0;
+    if (refused) {
+      throw new QsynthError(
+        "UNSUPPORTED_CONSTRUCT",
+        `${refused.what} is not supported.`,
+        refused.hint || `The subset accepts: ${SUPPORTED.join(", ")}.`,
+        { span: token.span, details: { construct: refused.what, operator: token.value, supported: SUPPORTED } }
+      );
+    }
+  }
+  const refuse = (token) => {
+    refuseIfKnown(token);
+    throw parseError(`Unexpected ${describe2(token)}.`, hintFor(token), token.span);
+  };
+  const parseType = () => {
+    const token = peek();
+    if (token.kind !== "ident") {
+      throw parseError(
+        `Expected a type annotation, found ${describe2(token)}.`,
+        'Annotate with "bit" for a single bit or "uintN" for an N-bit unsigned integer, for example "uint4".',
+        token.span
+      );
+    }
+    next();
+    if (token.value === "bit") return { kind: "bit", span: token.span };
+    const match = /^uint(\d+)$/.exec(token.value);
+    if (!match) {
+      throw parseError(
+        `"${token.value}" is not a type in the subset.`,
+        `The types are "bit" and "uintN" \u2014 for example "uint4". Python's int is unbounded, which has no finite circuit, so every integer here carries its width in its name.`,
+        token.span
+      );
+    }
+    const width = Number(match[1]);
+    if (width < 1 || width > MAX_UINT_WIDTH) {
+      throw parseError(
+        `"uint${width}" is out of range; widths run from 1 to ${MAX_UINT_WIDTH}.`,
+        `A wider value would need more than ${MAX_UINT_WIDTH} qubits for one operand alone.`,
+        token.span
+      );
+    }
+    return { kind: "uint", width, span: token.span };
+  };
+  const parseReturnType = () => {
+    if (accept("op", "(")) {
+      const types = [parseType()];
+      while (accept("op", ",")) {
+        if (at("op", ")")) break;
+        types.push(parseType());
+      }
+      expect("op", ")", '")" to close the return type');
+      return { types, tuple: true };
+    }
+    if (at("ident", "tuple")) {
+      next();
+      expect("op", "[", '"[" after "tuple"');
+      const types = [parseType()];
+      while (accept("op", ",")) types.push(parseType());
+      expect("op", "]", '"]" to close the return type');
+      return { types, tuple: true };
+    }
+    return { types: [parseType()], tuple: false };
+  };
+  const spanFrom = (start, end) => ({
+    start: start.start,
+    end: end.end,
+    line: start.line,
+    column: start.column
+  });
+  const parseExpr = () => parseTernary();
+  const parseTernary = () => {
+    const body2 = parseOrTest();
+    if (!at("keyword", "if")) return body2;
+    next();
+    const test = parseOrTest();
+    if (!at("keyword", "else")) {
+      throw parseError(
+        'A conditional expression needs an "else" branch.',
+        'Write "a if cond else b". Without the else there is no value when the condition is false, and a circuit has to produce a bit either way.',
+        peek().span
+      );
+    }
+    next();
+    const orelse = parseTernary();
+    return { kind: "ternary", test, ifTrue: body2, ifFalse: orelse, span: spanFrom(body2.span, orelse.span) };
+  };
+  const parseOrTest = () => {
+    let left = parseAndTest();
+    while (at("keyword", "or")) {
+      next();
+      const right = parseAndTest();
+      left = { kind: "logical", op: "or", left, right, span: spanFrom(left.span, right.span) };
+    }
+    return left;
+  };
+  const parseAndTest = () => {
+    let left = parseNotTest();
+    while (at("keyword", "and")) {
+      next();
+      const right = parseNotTest();
+      left = { kind: "logical", op: "and", left, right, span: spanFrom(left.span, right.span) };
+    }
+    return left;
+  };
+  const parseNotTest = () => {
+    if (at("keyword", "not")) {
+      const token = next();
+      const operand = parseNotTest();
+      return { kind: "not", operand, span: spanFrom(token.span, operand.span) };
+    }
+    return parseComparison();
+  };
+  const parseComparison = () => {
+    let left = parseBitOr();
+    let chain = null;
+    while (at("op") && CMP_OPS.has(peek().value)) {
+      const op = next().value;
+      const right = parseBitOr();
+      const link = { kind: "compare", op, left, right, span: spanFrom(left.span, right.span) };
+      chain = chain === null ? link : { kind: "logical", op: "and", left: chain, right: link, span: spanFrom(chain.span, link.span) };
+      left = right;
+    }
+    return chain ?? left;
+  };
+  const binaryLevel = (ops, below) => () => {
+    let left = below();
+    for (; ; ) {
+      const token = peek();
+      if (token.kind !== "op" || !ops.includes(token.value)) break;
+      next();
+      const right = below();
+      left = { kind: "binary", op: token.value, left, right, span: spanFrom(left.span, right.span) };
+    }
+    return left;
+  };
+  const parseUnary = () => {
+    const token = peek();
+    if (token.kind === "op" && token.value === "~") {
+      next();
+      const operand = parseUnary();
+      return { kind: "invert", operand, span: spanFrom(token.span, operand.span) };
+    }
+    if (token.kind === "op" && token.value === "-") {
+      next();
+      throw unsupported("Unary minus", SUPPORTED, token.span);
+    }
+    if (token.kind === "op" && token.value === "+") {
+      next();
+      return parseUnary();
+    }
+    return parseTrailers(parsePrimary());
+  };
+  const parseArith = binaryLevel(["+", "-"], parseUnary);
+  const parseShift = binaryLevel(["<<", ">>"], parseArith);
+  const parseBitAnd = binaryLevel(["&"], parseShift);
+  const parseBitXor = binaryLevel(["^"], parseBitAnd);
+  const parseBitOr = binaryLevel(["|"], parseBitXor);
+  function parseTrailers(base) {
+    let value = base;
+    for (; ; ) {
+      if (at("op", "[")) {
+        const open = next();
+        const lower = at("op", ":") ? null : parseExpr();
+        if (accept("op", ":")) {
+          const upper = at("op", "]") ? null : parseExpr();
+          const close2 = expect("op", "]", '"]" to close the slice');
+          value = { kind: "slice", value, lower, upper, span: spanFrom(value.span, close2.span) };
+          continue;
+        }
+        if (lower === null) throw parseError("An index is missing.", "Write x[0] or x[0:2].", open.span);
+        const close = expect("op", "]", '"]" to close the index');
+        value = { kind: "index", value, index: lower, span: spanFrom(value.span, close.span) };
+        continue;
+      }
+      if (at("op", "(")) {
+        throw unsupported(
+          "Calling a function",
+          SUPPORTED,
+          peek().span
+        );
+      }
+      if (at("op", ".")) {
+        throw unsupported("Attribute access", SUPPORTED, peek().span);
+      }
+      return value;
+    }
+  }
+  function parsePrimary() {
+    const token = peek();
+    if (token.kind === "ident") {
+      next();
+      return { kind: "name", name: token.value, span: token.span };
+    }
+    if (token.kind === "number") {
+      next();
+      return { kind: "num", value: parseNumber(token), span: token.span };
+    }
+    if (token.kind === "keyword" && (token.value === "True" || token.value === "False")) {
+      next();
+      return { kind: "bool", value: token.value === "True" ? 1 : 0, span: token.span };
+    }
+    if (token.kind === "op" && token.value === "(") {
+      next();
+      const inner = parseExpr();
+      if (at("op", ",")) {
+        throw unsupported("A tuple in an expression", SUPPORTED, token.span);
+      }
+      expect("op", ")", '")" to close the group');
+      return inner;
+    }
+    if (token.kind === "op" && token.value === "[") {
+      throw unsupported("A list literal", SUPPORTED, token.span);
+    }
+    return refuse(token);
+  }
+  const parseSuite = (what) => {
+    expect("op", ":", `":" after the ${what}`);
+    if (!at("newline")) {
+      throw parseError(
+        `The body of the ${what} must be on its own indented line.`,
+        'One-line bodies like "if a: b = 1" are not accepted; the indented form is the only one, so block structure always reads the same way.',
+        peek().span
+      );
+    }
+    skipNewlines();
+    if (!at("indent")) {
+      throw parseError(
+        `The body of the ${what} is empty or not indented.`,
+        "Indent the body by four spaces.",
+        peek().span
+      );
+    }
+    next();
+    const body2 = [];
+    while (!at("dedent") && !at("eof")) {
+      skipNewlines();
+      if (at("dedent") || at("eof")) break;
+      body2.push(parseStatement());
+    }
+    accept("dedent");
+    if (body2.length === 0) {
+      throw parseError(`The body of the ${what} is empty.`, 'Write "pass" if it is deliberately empty.', peek().span);
+    }
+    return body2;
+  };
+  function parseStatement() {
+    const token = peek();
+    if (token.kind === "keyword") {
+      switch (token.value) {
+        case "if":
+          return parseIf();
+        case "for":
+          return parseFor();
+        case "assert": {
+          next();
+          const test = parseExpr();
+          endOfStatement();
+          return { kind: "assert", test, span: spanFrom(token.span, test.span) };
+        }
+        case "return": {
+          next();
+          const values2 = [parseExpr()];
+          while (accept("op", ",")) values2.push(parseExpr());
+          endOfStatement();
+          return { kind: "return", values: values2, span: spanFrom(token.span, values2[values2.length - 1].span) };
+        }
+        case "pass":
+          next();
+          endOfStatement();
+          return { kind: "pass", span: token.span };
+        case "def":
+          throw unsupported(
+            "A nested function definition",
+            SUPPORTED,
+            token.span
+          );
+        case "elif":
+        case "else":
+          throw parseError(
+            `"${token.value}" does not follow an "if".`,
+            'Check the indentation of the "if" this was meant to belong to.',
+            token.span
+          );
+        default:
+          return refuse(token);
+      }
+    }
+    if (token.kind !== "ident") return refuse(token);
+    const targets = [{ name: token.value, span: token.span }];
+    next();
+    if (at("op") && AUG_OPS[peek().value] !== void 0) {
+      const opToken = next();
+      const value = parseExpr();
+      endOfStatement();
+      return {
+        kind: "aug",
+        target: targets[0],
+        op: AUG_OPS[opToken.value],
+        value,
+        span: spanFrom(token.span, value.span)
+      };
+    }
+    let annotation = null;
+    if (accept("op", ":")) annotation = parseType();
+    while (accept("op", ",")) {
+      const name = expect("ident", void 0, "another name to assign to");
+      targets.push({ name: name.value, span: name.span });
+    }
+    if (at("op", "[")) {
+      throw unsupported(
+        "Assigning to an index",
+        SUPPORTED,
+        peek().span
+      );
+    }
+    expect("op", "=", '"=" \u2014 a statement here must assign to a name');
+    const values = [parseExpr()];
+    while (accept("op", ",")) values.push(parseExpr());
+    endOfStatement();
+    return { kind: "assign", targets, annotation, values, span: spanFrom(token.span, values[values.length - 1].span) };
+  }
+  function parseIf() {
+    const token = at("keyword", "elif") ? next() : expect("keyword", "if", '"if"');
+    const test = parseExpr();
+    const body2 = parseSuite(token.value === "elif" ? "elif" : "if");
+    skipNewlines();
+    let orelse = [];
+    if (at("keyword", "elif")) {
+      orelse = [parseIf()];
+    } else if (at("keyword", "else")) {
+      next();
+      orelse = parseSuite("else");
+    }
+    return { kind: "if", test, body: body2, orelse, span: spanFrom(token.span, test.span) };
+  }
+  function parseFor() {
+    const token = expect("keyword", "for", '"for"');
+    const name = expect("ident", void 0, "the loop variable");
+    if (!at("keyword", "in")) {
+      throw parseError(`Expected "in" after the loop variable, found ${describe2(peek())}.`, 'Write "for i in range(4):".', peek().span);
+    }
+    next();
+    if (!at("keyword", "range")) {
+      throw unsupported(
+        `Iterating over ${describe2(peek())}`,
+        SUPPORTED,
+        peek().span
+      );
+    }
+    next();
+    expect("op", "(", '"(" after "range"');
+    const args = [parseExpr()];
+    while (accept("op", ",")) args.push(parseExpr());
+    expect("op", ")", '")" to close range(...)');
+    if (args.length > 3) {
+      throw parseError("range() takes at most three arguments.", "Write range(stop), range(start, stop) or range(start, stop, step).", token.span);
+    }
+    const body2 = parseSuite("for");
+    return { kind: "for", name: name.value, nameSpan: name.span, args, body: body2, span: spanFrom(token.span, name.span) };
+  }
+  function endOfStatement() {
+    if (at("newline") || at("eof") || at("dedent")) {
+      accept("newline");
+      return;
+    }
+    refuseIfKnown(peek());
+    throw parseError(`Expected the end of the line, found ${describe2(peek())}.`, hintFor(peek()), peek().span);
+  }
+  skipNewlines();
+  if (!at("keyword", "def")) {
+    throw parseError(
+      `A Python specification starts with a function definition, but this file starts with ${describe2(peek())}.`,
+      "Write, for example:\n  def half_adder(a: bit, b: bit) -> (bit, bit):\n      return a ^ b, a & b",
+      peek().span
+    );
+  }
+  const defToken = next();
+  const nameToken = expect("ident", void 0, "the function name");
+  expect("op", "(", '"(" after the function name');
+  const params = [];
+  if (!at("op", ")")) {
+    for (; ; ) {
+      const paramName = expect("ident", void 0, "a parameter name");
+      if (!at("op", ":")) {
+        throw parseError(
+          `Parameter "${paramName.value}" has no type annotation.`,
+          'Every parameter needs one \u2014 "bit" or "uintN" \u2014 because the annotation is what fixes how many qubits the parameter costs. Write "def f(a: bit, b: uint4):".',
+          paramName.span
+        );
+      }
+      next();
+      const type = parseType();
+      params.push({ name: paramName.value, type, span: paramName.span });
+      if (!accept("op", ",")) break;
+      if (at("op", ")")) break;
+    }
+  }
+  expect("op", ")", '")" to close the parameter list');
+  if (!at("op", "->")) {
+    throw parseError(
+      "The function has no return type annotation.",
+      'Write "-> bit", "-> uint4", or "-> (bit, bit)" for several outputs. The annotation fixes the width of each output, which a circuit has to know before it can be built.',
+      peek().span
+    );
+  }
+  next();
+  const { types: returns, tuple: returnsTuple } = parseReturnType();
+  const body = parseSuite("function");
+  skipNewlines();
+  if (!at("eof")) {
+    throw parseError(
+      `A specification holds exactly one function, but there is more after it: ${describe2(peek())}.`,
+      "Compile each function as its own specification.",
+      peek().span
+    );
+  }
+  return {
+    name: nameToken.value,
+    params,
+    returns,
+    returnsTuple,
+    body,
+    span: spanFrom(defToken.span, nameToken.span)
+  };
+}
+function parseNumber(token) {
+  const text = token.value.replace(/_/g, "");
+  const value = Number(text);
+  if (!Number.isInteger(value) || value < 0) {
+    throw parseError(`"${token.value}" is not a non-negative integer.`, "Integer literals only.", token.span);
+  }
+  if (value > 2 ** 32) {
+    throw parseError(`${token.value} is too large.`, `Literals must fit in ${MAX_UINT_WIDTH} bits when used as a value.`, token.span);
+  }
+  return value;
+}
+function reservedDescription(word) {
+  const descriptions = {
+    while: "A while loop",
+    class: "A class definition",
+    import: "An import",
+    from: "An import",
+    lambda: "A lambda",
+    try: "A try block",
+    except: "An except block",
+    finally: "A finally block",
+    with: "A with block",
+    yield: "yield",
+    global: "A global declaration",
+    nonlocal: "A nonlocal declaration",
+    del: "del",
+    raise: "raise",
+    async: "async",
+    await: "await",
+    match: "A match statement",
+    case: "A case clause",
+    is: 'The "is" operator',
+    None: "None",
+    break: "break",
+    continue: "continue",
+    as: '"as"'
+  };
+  return descriptions[word] ?? `"${word}"`;
+}
+function describe2(token) {
+  switch (token.kind) {
+    case "eof":
+      return "the end of the file";
+    case "newline":
+      return "the end of the line";
+    case "indent":
+      return "an indented line";
+    case "dedent":
+      return "the end of the block";
+    case "ident":
+      return `"${token.value}"`;
+    case "number":
+      return `the number ${token.value}`;
+    default:
+      return `"${token.value}"`;
+  }
+}
+function hintFor(token) {
+  const refused = REFUSED_OPS[token.value];
+  if (token.kind === "op" && refused) return refused.hint || `${refused.what} is not part of the subset.`;
+  return `The subset accepts: ${SUPPORTED.join(", ")}.`;
+}
+
+// packages/qsynth-core/src/frontend/python/values.ts
+function zeroExtend(builder, value, width, span) {
+  if (value.bits.length >= width) return value;
+  const bits = [...value.bits];
+  while (bits.length < width) bits.push(builder.constant(0, span));
+  return { bits };
+}
+var truncate = (value, width) => ({ bits: value.bits.slice(0, width) });
+function constantBits(builder, value, width, span) {
+  const bits = [];
+  for (let i = 0; i < width; i++) bits.push(builder.constant(value >> i & 1, span));
+  return { bits };
+}
+function align(builder, a, b, span) {
+  const width = Math.max(a.bits.length, b.bits.length);
+  return { a: zeroExtend(builder, a, width, span), b: zeroExtend(builder, b, width, span), width };
+}
+function bitwise(builder, op, left, right, span, name) {
+  const { a, b, width } = align(builder, left, right, span);
+  const bits = [];
+  for (let i = 0; i < width; i++) bits.push(builder.op(op, [a.bits[i], b.bits[i]], span, name));
+  return { bits };
+}
+function invert2(builder, value, span, name) {
+  return { bits: value.bits.map((bit) => builder.op("not", [bit], span, name)) };
+}
+function add2(builder, left, right, span, name) {
+  const { a, b, width } = align(builder, left, right, span);
+  const bits = [];
+  let carry = null;
+  for (let i = 0; i < width; i++) {
+    const x = a.bits[i];
+    const y = b.bits[i];
+    const propagate = builder.op("xor", [x, y], span, name);
+    if (carry === null) {
+      bits.push(propagate);
+      carry = builder.op("and", [x, y], span, name);
+    } else {
+      bits.push(builder.op("xor", [propagate, carry], span, name));
+      carry = builder.op("mux", [propagate, carry, x], span, name);
+    }
+  }
+  bits.push(carry);
+  return { bits };
+}
+function subtract(builder, left, right, span, name) {
+  const { a, b, width } = align(builder, left, right, span);
+  const complement = invert2(builder, b, span, name);
+  const bits = [];
+  let carry = builder.constant(1, span);
+  for (let i = 0; i < width; i++) {
+    const x = a.bits[i];
+    const y = complement.bits[i];
+    const propagate = builder.op("xor", [x, y], span, name);
+    bits.push(builder.op("xor", [propagate, carry], span, name));
+    carry = builder.op("mux", [propagate, carry, x], span, name);
+  }
+  return { bits };
+}
+function lessThan(builder, left, right, span, name) {
+  const { a, b, width } = align(builder, left, right, span);
+  let borrow = null;
+  for (let i = 0; i < width; i++) {
+    const x = a.bits[i];
+    const y = b.bits[i];
+    if (borrow === null) {
+      borrow = builder.op("and", [builder.op("not", [x], span, name), y], span, name);
+      continue;
+    }
+    const same = builder.op("xnor", [x, y], span, name);
+    borrow = builder.op("mux", [same, borrow, y], span, name);
+  }
+  return borrow;
+}
+function equals(builder, left, right, span, name) {
+  const { a, b, width } = align(builder, left, right, span);
+  let level = [];
+  for (let i = 0; i < width; i++) level.push(builder.op("xnor", [a.bits[i], b.bits[i]], span, name));
+  while (level.length > 1) {
+    const next = [];
+    for (let i = 0; i < level.length; i += 2) {
+      const first = level[i];
+      const second = level[i + 1];
+      next.push(second === void 0 ? first : builder.op("and", [first, second], span, name));
+    }
+    level = next;
+  }
+  return level[0];
+}
+function reduceOr(builder, value, span, name) {
+  let level = [...value.bits];
+  while (level.length > 1) {
+    const next = [];
+    for (let i = 0; i < level.length; i += 2) {
+      const first = level[i];
+      const second = level[i + 1];
+      next.push(second === void 0 ? first : builder.op("or", [first, second], span, name));
+    }
+    level = next;
+  }
+  return level[0];
+}
+function select(builder, selector, ifOne, ifZero, span, name) {
+  const { a, b, width } = align(builder, ifOne, ifZero, span);
+  const bits = [];
+  for (let i = 0; i < width; i++) bits.push(builder.op("mux", [selector, a.bits[i], b.bits[i]], span, name));
+  return { bits };
+}
+function shiftLeft(builder, value, amount, span) {
+  if (amount === 0) return value;
+  const bits = [];
+  for (let i = 0; i < amount; i++) bits.push(builder.constant(0, span));
+  bits.push(...value.bits);
+  return { bits };
+}
+function shiftRight(builder, value, amount, span) {
+  if (amount === 0) return value;
+  const kept = value.bits.slice(amount);
+  return kept.length > 0 ? { bits: kept } : { bits: [builder.constant(0, span)] };
+}
+
+// packages/qsynth-core/src/frontend/python/lower.ts
+var MAX_UNROLL = 256;
+var bitsValue = (bits) => ({ kind: "bits", bits });
+var intValue = (value) => ({ kind: "int", value });
+var bitLength = (value) => value === 0 ? 1 : 32 - Math.clz32(value);
+function lowerPython(source, options = {}) {
+  return lowerFunction(parsePython(source), options);
+}
+function lowerFunction(fn, options = {}) {
+  const builder = new ModuleBuilder(options.moduleName ?? fn.name);
+  const trace = options.trace;
+  let scope = /* @__PURE__ */ new Map();
+  let guard = null;
+  const assertionNames = /* @__PURE__ */ new Set();
+  for (const param of fn.params) {
+    if (scope.has(param.name)) {
+      throw parseError(
+        `Parameter "${param.name}" is declared twice.`,
+        "Each parameter needs its own name.",
+        param.span
+      );
+    }
+    const width = widthOfType(param.type);
+    const bits = [];
+    for (let i = 0; i < width; i++) {
+      bits.push(builder.input(width === 1 ? param.name : `${param.name}[${i}]`, param.span));
+    }
+    scope.set(param.name, bitsValue({ bits }));
+    trace?.add({
+      phase: "parse",
+      kind: "input.declared",
+      message: width === 1 ? `"${param.name}" is an input bit.` : `"${param.name}" is a ${width}-bit unsigned input, costing input bits ${param.name}[0] through ${param.name}[${width - 1}], least significant first.`,
+      span: param.span,
+      detail: { name: param.name, width }
+    });
+  }
+  const toBits = (value, span) => {
+    if (value.kind === "bits") return value.bits;
+    return constantBits(builder, value.value, bitLength(value.value), span);
+  };
+  const toBit = (value, span, label) => {
+    const bits = toBits(value, span);
+    if (bits.bits.length === 1) return bits.bits[0];
+    trace?.add({
+      phase: "parse",
+      kind: "coerce.truth",
+      message: `A ${bits.bits.length}-bit value is used as a condition, so it is tested for being non-zero, as Python does.`,
+      span
+    });
+    return reduceOr(builder, bits, span, label);
+  };
+  const constantInt = (expr, what) => {
+    const value = evaluate2(expr);
+    if (value.kind !== "int") {
+      throw invalidSpec(
+        `${what} has to be known when the circuit is built, but this one depends on an input.`,
+        "A shift, an index and a range bound all fix how the wires are connected, so they cannot vary per input. Use a literal or a loop variable.",
+        {},
+        expr.span
+      );
+    }
+    return value.value;
+  };
+  function evaluate2(expr, label) {
+    switch (expr.kind) {
+      case "num":
+        return intValue(expr.value);
+      case "bool":
+        return bitsValue({ bits: [builder.constant(expr.value, expr.span)] });
+      case "name": {
+        const found = scope.get(expr.name);
+        if (found === void 0) {
+          throw parseError(
+            `"${expr.name}" is not defined.`,
+            suggest2(expr.name, [...scope.keys()]) ?? "Assign it before this line, or add it as a parameter.",
+            expr.span
+          );
+        }
+        return found;
+      }
+      case "not": {
+        const operand = evaluate2(expr.operand);
+        if (operand.kind === "int") return intValue(operand.value === 0 ? 1 : 0);
+        return bitsValue({ bits: [builder.op("not", [toBit(operand, expr.span)], expr.span, label)] });
+      }
+      case "invert": {
+        const operand = evaluate2(expr.operand);
+        if (operand.kind === "int") {
+          throw invalidSpec(
+            '"~" applied to an integer literal has no width to invert within.',
+            "In Python ~5 is -6, because int is unbounded and there are no negative values here. Invert a value whose width is declared, or mask instead: x ^ 0b1111.",
+            {},
+            expr.span
+          );
+        }
+        return bitsValue(invert2(builder, operand.bits, expr.span, label));
+      }
+      case "logical": {
+        const left = evaluate2(expr.left);
+        const right = evaluate2(expr.right);
+        if (left.kind === "int" && right.kind === "int") {
+          const value = expr.op === "and" ? left.value !== 0 && right.value !== 0 : left.value !== 0 || right.value !== 0;
+          return intValue(value ? 1 : 0);
+        }
+        const a = toBit(left, expr.left.span);
+        const b = toBit(right, expr.right.span);
+        return bitsValue({ bits: [builder.op(expr.op, [a, b], expr.span, label)] });
+      }
+      case "compare":
+        return compare(expr, label);
+      case "binary":
+        return binary(expr, label);
+      case "ternary": {
+        const test = evaluate2(expr.test);
+        if (test.kind === "int") {
+          trace?.add({
+            phase: "parse",
+            kind: "branch.constant",
+            message: `The condition of this conditional expression is ${test.value !== 0 ? "always true" : "always false"} when the circuit is built, so only one side is built.`,
+            span: expr.span
+          });
+          return evaluate2(test.value !== 0 ? expr.ifTrue : expr.ifFalse, label);
+        }
+        const selector = toBit(test, expr.test.span);
+        const ifTrue = toBits(evaluate2(expr.ifTrue), expr.ifTrue.span);
+        const ifFalse = toBits(evaluate2(expr.ifFalse), expr.ifFalse.span);
+        return bitsValue(select(builder, selector, ifTrue, ifFalse, expr.span, label));
+      }
+      case "index": {
+        const value = evaluate2(expr.value);
+        const index = constantInt(expr.index, "An index");
+        const bits = toBits(value, expr.span);
+        if (index < 0 || index >= bits.bits.length) {
+          throw invalidSpec(
+            `Bit ${index} does not exist; this value is ${bits.bits.length} bit(s) wide.`,
+            `Indices run from 0 (least significant) to ${bits.bits.length - 1}.`,
+            { index, width: bits.bits.length },
+            expr.span
+          );
+        }
+        return bitsValue({ bits: [bits.bits[index]] });
+      }
+      case "slice": {
+        const value = evaluate2(expr.value);
+        const bits = toBits(value, expr.span);
+        const lower = expr.lower === null ? 0 : constantInt(expr.lower, "The start of a slice");
+        const upper = expr.upper === null ? bits.bits.length : constantInt(expr.upper, "The end of a slice");
+        if (lower < 0 || upper > bits.bits.length || lower >= upper) {
+          throw invalidSpec(
+            `The slice [${lower}:${upper}] does not select any bits of a ${bits.bits.length}-bit value.`,
+            `The start must be below the end, and both within 0 to ${bits.bits.length}.`,
+            { lower, upper, width: bits.bits.length },
+            expr.span
+          );
+        }
+        return bitsValue({ bits: bits.bits.slice(lower, upper) });
+      }
+    }
+  }
+  function compare(expr, label) {
+    const left = evaluate2(expr.left);
+    const right = evaluate2(expr.right);
+    if (left.kind === "int" && right.kind === "int") {
+      const a2 = left.value;
+      const b2 = right.value;
+      const result = expr.op === "==" ? a2 === b2 : expr.op === "!=" ? a2 !== b2 : expr.op === "<" ? a2 < b2 : expr.op === "<=" ? a2 <= b2 : expr.op === ">" ? a2 > b2 : a2 >= b2;
+      return intValue(result ? 1 : 0);
+    }
+    const a = toBits(left, expr.left.span);
+    const b = toBits(right, expr.right.span);
+    const span = expr.span;
+    const negate = (node) => builder.op("not", [node], span, label);
+    switch (expr.op) {
+      case "==":
+        return bitsValue({ bits: [equals(builder, a, b, span, label)] });
+      case "!=":
+        return bitsValue({ bits: [negate(equals(builder, a, b, span, label))] });
+      case "<":
+        return bitsValue({ bits: [lessThan(builder, a, b, span, label)] });
+      case ">=":
+        return bitsValue({ bits: [negate(lessThan(builder, a, b, span, label))] });
+      case ">":
+        return bitsValue({ bits: [lessThan(builder, b, a, span, label)] });
+      case "<=":
+        return bitsValue({ bits: [negate(lessThan(builder, b, a, span, label))] });
+    }
+  }
+  function binary(expr, label) {
+    const span = expr.span;
+    if (expr.op === "<<" || expr.op === ">>") {
+      const value = evaluate2(expr.left);
+      const amount = constantInt(expr.right, "A shift amount");
+      if (amount < 0 || amount > 64) {
+        throw invalidSpec(
+          `A shift by ${amount} is out of range.`,
+          "Shift by 0 to 64. A shift is rewiring, so the amount has to be a fixed number of positions.",
+          { amount },
+          span
+        );
+      }
+      if (value.kind === "int") {
+        return intValue(expr.op === "<<" ? value.value * 2 ** amount : Math.floor(value.value / 2 ** amount));
+      }
+      return bitsValue(
+        expr.op === "<<" ? shiftLeft(builder, value.bits, amount, span) : shiftRight(builder, value.bits, amount, span)
+      );
+    }
+    const left = evaluate2(expr.left);
+    const right = evaluate2(expr.right);
+    if (left.kind === "int" && right.kind === "int") {
+      switch (expr.op) {
+        case "+":
+          return intValue(left.value + right.value);
+        case "-": {
+          const value = left.value - right.value;
+          if (value < 0) {
+            throw invalidSpec(
+              `${left.value} - ${right.value} is negative, and there are no negative values here.`,
+              "Both sides are known when the circuit is built, so this is a counting mistake rather than a wrapping subtraction. Values wrap only when they are bit vectors of a declared width.",
+              {},
+              span
+            );
+          }
+          return intValue(value);
+        }
+        case "&":
+          return intValue(left.value & right.value);
+        case "|":
+          return intValue(left.value | right.value);
+        case "^":
+          return intValue(left.value ^ right.value);
+      }
+    }
+    const a = toBits(left, expr.left.span);
+    const b = toBits(right, expr.right.span);
+    switch (expr.op) {
+      case "+":
+        return bitsValue(add2(builder, a, b, span, label));
+      case "-":
+        return bitsValue(subtract(builder, a, b, span, label));
+      case "&":
+        return bitsValue(bitwise(builder, "and", a, b, span, label));
+      case "|":
+        return bitsValue(bitwise(builder, "or", a, b, span, label));
+      case "^":
+        return bitsValue(bitwise(builder, "xor", a, b, span, label));
+    }
+  }
+  const applyType = (value, type, name, span) => {
+    const width = widthOfType(type);
+    const bits = toBits(value, span);
+    if (bits.bits.length === width) return bitsValue(bits);
+    if (bits.bits.length < width) return bitsValue(zeroExtend(builder, bits, width, span));
+    if (type.kind === "bit") {
+      throw invalidSpec(
+        `"${name}" is declared as a bit, but the value assigned to it is ${bits.bits.length} bits wide.`,
+        `Write "${name} = x != 0" to test whether it is non-zero, or "${name} = x[0]" for its low bit \u2014 silently keeping one of the two would make the line mean something it does not say.`,
+        { name, declared: 1, actual: bits.bits.length },
+        span
+      );
+    }
+    trace?.add({
+      phase: "parse",
+      kind: "coerce.truncate",
+      message: `"${name}" is declared ${width} bits wide, so the value's top ${bits.bits.length - width} bit(s) are dropped \u2014 it wraps, as a fixed-width register does.`,
+      span,
+      detail: { name, declared: width, actual: bits.bits.length }
+    });
+    return bitsValue(truncate(bits, width));
+  };
+  const assign = (name, value) => {
+    scope.set(name, value);
+  };
+  function execute(statements) {
+    for (const statement of statements) {
+      switch (statement.kind) {
+        case "pass":
+          break;
+        case "return":
+          throw unsupported(
+            "A return anywhere but the last line of the function",
+            [
+              "one return, as the last statement",
+              "assigning to a name in every branch and returning it at the end"
+            ],
+            statement.span
+          );
+        case "assign": {
+          if (statement.annotation !== null && statement.targets.length > 1) {
+            throw parseError(
+              "A type annotation applies to a single name.",
+              "Write the annotated assignment on its own line.",
+              statement.span
+            );
+          }
+          if (statement.targets.length !== statement.values.length) {
+            throw parseError(
+              `${statement.targets.length} name(s) on the left, ${statement.values.length} value(s) on the right.`,
+              statement.values.length === 1 ? 'There are no calls or tuples in the subset, so each name needs its own value: "s, c = a ^ b, a & b".' : "Give each name exactly one value.",
+              statement.span
+            );
+          }
+          const values = statement.values.map((value, i) => evaluate2(value, statement.targets[i].name));
+          statement.targets.forEach((target, i) => {
+            const value = statement.annotation ? applyType(values[i], statement.annotation, target.name, target.span) : values[i];
+            assign(target.name, value);
+          });
+          break;
+        }
+        case "aug": {
+          const current = scope.get(statement.target.name);
+          if (current === void 0) {
+            throw parseError(
+              `"${statement.target.name}" has no value yet, so it cannot be updated in place.`,
+              `Assign it first: "${statement.target.name} = ..."`,
+              statement.span
+            );
+          }
+          const value = binary(
+            { kind: "binary", op: statement.op, left: { kind: "name", name: statement.target.name, span: statement.target.span }, right: statement.value, span: statement.span },
+            statement.target.name
+          );
+          assign(statement.target.name, value);
+          break;
+        }
+        case "assert": {
+          const test = evaluate2(statement.test);
+          if (test.kind === "int") {
+            if (test.value === 0) {
+              throw invalidSpec(
+                "This assertion is false when the circuit is built, so no circuit can satisfy it.",
+                "Both sides are known here; check the constants and the loop bounds.",
+                {},
+                statement.span
+              );
+            }
+            trace?.add({
+              phase: "parse",
+              kind: "assertion.constant",
+              message: "This assertion is true when the circuit is built, so it costs no gates and is not checked at run time.",
+              span: statement.span
+            });
+            break;
+          }
+          const bit = toBit(test, statement.span);
+          const node = guard === null ? bit : builder.op("or", [builder.op("not", [guard], statement.span), bit], statement.span);
+          const name = uniqueAssertionName(assertionNames, statement.span.line);
+          builder.assertion(name, node, statement.span);
+          trace?.add({
+            phase: "parse",
+            kind: guard === null ? "assertion.bind" : "assertion.guarded",
+            message: guard === null ? `Invariant "${name}" must hold for every input assignment; it is checked, not synthesised into an output.` : `Invariant "${name}" is inside a branch, so it is checked as an implication: it must hold wherever that branch is taken, and is not required elsewhere.`,
+            nodeId: node,
+            span: statement.span
+          });
+          break;
+        }
+        case "if":
+          lowerIf(statement);
+          break;
+        case "for":
+          lowerFor(statement);
+          break;
+      }
+    }
+  }
+  function lowerIf(statement) {
+    const test = evaluate2(statement.test);
+    if (test.kind === "int") {
+      trace?.add({
+        phase: "parse",
+        kind: "branch.constant",
+        message: `This condition is ${test.value !== 0 ? "always true" : "always false"} when the circuit is built, so only the ${test.value !== 0 ? '"if"' : '"else"'} side is built.`,
+        span: statement.span
+      });
+      execute(test.value !== 0 ? statement.body : statement.orelse);
+      return;
+    }
+    const selector = toBit(test, statement.test.span);
+    const notSelector = builder.op("not", [selector], statement.test.span);
+    const before = scope;
+    const outerGuard = guard;
+    const branch = (body, condition) => {
+      scope = new Map(before);
+      guard = outerGuard === null ? condition : builder.op("and", [outerGuard, condition], statement.span);
+      execute(body);
+      const result = scope;
+      scope = before;
+      guard = outerGuard;
+      return result;
+    };
+    const taken = branch(statement.body, selector);
+    const untaken = branch(statement.orelse, notSelector);
+    const merged = new Map(before);
+    let muxed = 0;
+    for (const name of /* @__PURE__ */ new Set([...taken.keys(), ...untaken.keys()])) {
+      const ifOne = taken.get(name);
+      const ifZero = untaken.get(name);
+      const prior = before.get(name);
+      const one = ifOne ?? prior;
+      const zero = ifZero ?? prior;
+      if (one === void 0 || zero === void 0) {
+        throw invalidSpec(
+          `"${name}" is assigned in only one branch of this "if", and has no value before it.`,
+          `Both branches produce a value here, because the circuit evaluates both. Give "${name}" a value before the "if", or assign it in the other branch as well.`,
+          { name },
+          statement.span
+        );
+      }
+      if (sameValue(one, zero)) {
+        merged.set(name, one);
+        continue;
+      }
+      merged.set(
+        name,
+        bitsValue(select(builder, selector, toBits(one, statement.span), toBits(zero, statement.span), statement.span, name))
+      );
+      muxed++;
+    }
+    scope = merged;
+    trace?.add({
+      phase: "parse",
+      kind: "branch.merge",
+      message: muxed === 0 ? 'Both sides of this "if" leave every name unchanged, so no selection gates are needed.' : `Both sides of this "if" are evaluated and ${muxed === 1 ? "the one name it changes is" : `the ${muxed} names it changes are`} selected by the condition \u2014 the IR has no branches, so a choice is a multiplexer.`,
+      span: statement.span,
+      detail: { muxed }
+    });
+  }
+  function lowerFor(statement) {
+    const bounds = statement.args.map((arg) => constantInt(arg, "A range bound"));
+    const start = bounds.length === 1 ? 0 : bounds[0];
+    const stop = bounds.length === 1 ? bounds[0] : bounds[1];
+    const step = bounds.length === 3 ? bounds[2] : 1;
+    if (step < 1) {
+      throw invalidSpec(
+        `range() needs a step of at least 1 here; this one is ${step}.`,
+        'Counting down is written the other way round, because the subset has no unary minus: loop upward and index with "n - i".',
+        { step },
+        statement.span
+      );
+    }
+    const iterations = start >= stop ? 0 : Math.ceil((stop - start) / step);
+    if (iterations > MAX_UNROLL) {
+      throw invalidSpec(
+        `This loop runs ${iterations} times; the limit is ${MAX_UNROLL}.`,
+        "Loops are unrolled, because a reversible circuit has no branches to jump back to, so the body is emitted once per iteration. Reduce the count or the width.",
+        { iterations, limit: MAX_UNROLL },
+        statement.span
+      );
+    }
+    trace?.add({
+      phase: "parse",
+      kind: "loop.unroll",
+      message: iterations === 0 ? `This loop runs zero times, so its body is not built.` : `This loop is unrolled into ${iterations} copies of its body, with "${statement.name}" fixed in each; a circuit has nothing to jump back to.`,
+      span: statement.span,
+      detail: { name: statement.name, start, stop, step, iterations }
+    });
+    const shadowed = scope.get(statement.name);
+    for (let i = start; i < stop; i += step) {
+      scope.set(statement.name, intValue(i));
+      execute(statement.body);
+    }
+    if (shadowed === void 0) scope.delete(statement.name);
+    else scope.set(statement.name, shadowed);
+  }
+  const last = fn.body[fn.body.length - 1];
+  if (last === void 0 || last.kind !== "return") {
+    throw parseError(
+      "The function does not end with a return.",
+      "The last statement has to be the return, because a circuit has one set of outputs and no way to leave early. Assign to names in the branches and return them at the end.",
+      last?.span ?? fn.span
+    );
+  }
+  execute(fn.body.slice(0, -1));
+  if (last.values.length !== fn.returns.length) {
+    throw parseError(
+      `The annotation declares ${fn.returns.length} return value(s), but ${last.values.length} ${last.values.length === 1 ? "is" : "are"} returned.`,
+      "The annotation fixes the width of each output, so there has to be one for each returned value.",
+      last.span
+    );
+  }
+  last.values.forEach((expr, i) => {
+    const declared = fn.returns[i];
+    const name = outputName(expr, i, last.values.length);
+    const value = applyType(evaluate2(expr, name), declared, name, expr.span);
+    const bits = toBits(value, expr.span);
+    bits.bits.forEach((node, bit) => {
+      builder.output(bits.bits.length === 1 ? name : `${name}[${bit}]`, node, expr.span);
+    });
+    trace?.add({
+      phase: "parse",
+      kind: "output.bind",
+      message: bits.bits.length === 1 ? `"${name}" is an output bit of the module.` : `"${name}" is a ${bits.bits.length}-bit output, exported as ${name}[0] through ${name}[${bits.bits.length - 1}], least significant first.`,
+      span: expr.span,
+      detail: { name, width: bits.bits.length }
+    });
+  });
+  return builder.build();
+}
+function widthOfType(type) {
+  return type.kind === "bit" ? 1 : type.width;
+}
+function outputName(expr, index, total) {
+  if (expr.kind === "name") return expr.name;
+  return total === 1 ? "out" : `out${index}`;
+}
+function uniqueAssertionName(used, line) {
+  const base = `assert_line_${line}`;
+  let name = base;
+  let n = 2;
+  while (used.has(name)) name = `${base}_${n++}`;
+  used.add(name);
+  return name;
+}
+function sameValue(a, b) {
+  if (a.kind === "int" && b.kind === "int") return a.value === b.value;
+  if (a.kind !== "bits" || b.kind !== "bits") return false;
+  return a.bits.bits.length === b.bits.bits.length && a.bits.bits.every((node, i) => node === b.bits.bits[i]);
+}
+function suggest2(name, candidates) {
+  let best;
+  for (const candidate of candidates) {
+    const distance = editDistance2(name.toLowerCase(), candidate.toLowerCase());
+    const allowed = candidate.length <= 4 ? 1 : 2;
+    if (distance <= allowed && (!best || distance < best.distance)) best = { name: candidate, distance };
+  }
+  return best ? `Did you mean "${best.name}"?` : void 0;
+}
+function editDistance2(a, b) {
+  const rows = [];
+  for (let i = 0; i <= a.length; i++) rows.push(new Array(b.length + 1).fill(0));
+  for (let i = 0; i <= a.length; i++) rows[i][0] = i;
+  for (let j = 0; j <= b.length; j++) rows[0][j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      let value = Math.min(rows[i - 1][j] + 1, rows[i][j - 1] + 1, rows[i - 1][j - 1] + cost);
+      if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) {
+        value = Math.min(value, rows[i - 2][j - 2] + 1);
+      }
+      rows[i][j] = value;
+    }
+  }
+  return rows[a.length][b.length];
+}
+
 // packages/qsynth-core/src/ir/quantum.ts
 var QUANTUM_ARITY = {
   x: 1,
@@ -2296,7 +3769,7 @@ function lowerNode(module, node, builder, nodeWire, trace) {
     assertInvariant(wire !== void 0, `operand ${node.args[i]} of node ${node.id} has no wire`);
     return wire;
   };
-  const record = builder.allocateAncilla(describe2(module, node), node.id, node.span);
+  const record = builder.allocateAncilla(describe3(module, node), node.id, node.span);
   const target = record.wire;
   const firstGate = builder.gateCount;
   const emit = (kind, wires) => builder.emit(kind, wires, { span: node.span, nodeId: node.id });
@@ -2353,7 +3826,7 @@ function lowerNode(module, node, builder, nodeWire, trace) {
   trace.add({
     phase: "lower",
     kind: "node.lower",
-    message: `${describe2(module, node)} is computed onto ancilla wire ${target} using ${builder.gateCount - firstGate} gate(s).`,
+    message: `${describe3(module, node)} is computed onto ancilla wire ${target} using ${builder.gateCount - firstGate} gate(s).`,
     nodeId: node.id,
     wires: [target, ...node.args.map((a) => nodeWire.get(a))],
     gateIndex: firstGate,
@@ -2361,7 +3834,7 @@ function lowerNode(module, node, builder, nodeWire, trace) {
     detail: { op: node.op, gates: builder.gateCount - firstGate }
   });
 }
-function describe2(module, node) {
+function describe3(module, node) {
   if (node.name) return `"${node.name}" (${node.op})`;
   const output = module.outputs.find((o) => o.node === node.id);
   if (output) return `output "${output.name}" (${node.op})`;
@@ -3405,7 +4878,7 @@ function checkEquivalence(module, circuit, options) {
       id: "simulation_equivalence",
       title: CHECK_TITLES.simulation_equivalence,
       status: "failed",
-      summary: `The circuit disagrees with the specification on at least one input assignment (${describe3(counterexample)}).`,
+      summary: `The circuit disagrees with the specification on at least one input assignment (${describe4(counterexample)}).`,
       durationMs: now() - started,
       coverage,
       counterexample
@@ -3433,7 +4906,7 @@ function checkEquivalence(module, circuit, options) {
     evidence: { decomposition: decomposition.evidence, ...decomposition.failure ? { failure: decomposition.failure } : {} }
   };
 }
-function describe3(cex) {
+function describe4(cex) {
   const inputs = Object.entries(cex.inputs).map(([k, v]) => `${k}=${v}`).join(", ");
   const wrong = Object.keys(cex.expected).filter((k) => cex.expected[k] !== cex.observed[k]);
   const detail = wrong.map((k) => `${k} expected ${cex.expected[k]}, got ${cex.observed[k]}`).join("; ");
@@ -4095,7 +5568,7 @@ function optimize(module, circuit, options) {
 }
 
 // packages/qsynth-core/src/compile.ts
-var SPEC_KINDS = ["boolean", "truthtable"];
+var SPEC_KINDS = ["boolean", "truthtable", "python"];
 var MAX_VERIFICATION_OPS = 5e7;
 var VERIFICATION_SWEEPS = 3 + 1 + OPTIMIZATION_PASSES.length;
 function preflight(module) {
@@ -4119,6 +5592,8 @@ function parseSpec(request, trace) {
       return lowerBoolean(request.source, { moduleName: name, trace });
     case "truthtable":
       return lowerTruthTable(request.source, { moduleName: name, trace });
+    case "python":
+      return lowerPython(request.source, { moduleName: request.name, trace });
     default:
       throw invalidSpec(
         `Unknown specification kind "${request.kind}".`,

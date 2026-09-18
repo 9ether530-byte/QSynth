@@ -284,3 +284,57 @@ describe('truth tables', () => {
     expect(equivalence.coverage.checked).toBeLessThan(equivalence.coverage.space);
   });
 });
+
+describe('the Python subset', () => {
+  const ADDER = ['def add2(x: uint2, y: uint2) -> uint3:', '    return x + y', ''].join('\n');
+
+  it('compiles a Python function over the wire and releases its artifact', async () => {
+    const res = await call('POST', '/v1/compile', {
+      auth: { token: org.token },
+      body: { projectId, kind: 'python', source: ADDER, name: 'python_add2' },
+    });
+    expect(res.status, JSON.stringify(res.body).slice(0, 400)).toBe(201);
+    expect(res.body.verification.passed).toBe(true);
+    expect(res.body.qasm).toContain('OPENQASM 3.0;');
+
+    // The export gate is the same gate for every frontend — a verified Python job must be
+    // downloadable on exactly the terms a verified Boolean job is.
+    const artifact = res.body.artifacts.find((a: { kind: string }) => a.kind === 'qasm3');
+    const download = await call('GET', `/v1/artifacts/${artifact.id}`, { auth: { token: org.token } });
+    expect(download.status).toBe(200);
+    expect(download.body.content).toContain('OPENQASM 3.0;');
+  });
+
+  it('refuses a construct outside the subset with the line and what is supported', async () => {
+    const before = await call('GET', `/v1/compile?projectId=${projectId}`, { auth: { token: org.token } });
+    const res = await call('POST', '/v1/compile', {
+      auth: { token: org.token },
+      body: { projectId, kind: 'python', source: 'def f(a: bit) -> bit:\n    while a:\n        a = a\n    return a\n' },
+    });
+    expect(res.status).toBe(422);
+    expect(errorCode(res)).toBe('UNSUPPORTED_CONSTRUCT');
+    expect(res.body.error.details.span.line).toBe(2);
+    expect(res.body.error.hint.length).toBeGreaterThan(0);
+
+    // A spec that never compiled is not a job: nothing is recorded but the refusal itself.
+    const after = await call('GET', `/v1/compile?projectId=${projectId}`, { auth: { token: org.token } });
+    expect(after.body.jobs).toHaveLength(before.body.jobs.length);
+  });
+
+  it('reaches the same circuit as the equivalent truth table', async () => {
+    // Same function, two notations. If the frontends were doing anything beyond notation,
+    // the resource figures would part company here.
+    const python = await call('POST', '/v1/compile/estimate', {
+      auth: { token: org.token },
+      body: { kind: 'python', source: 'def f(a: bit, b: bit) -> bit:\n    return a & b\n' },
+    });
+    const table = await call('POST', '/v1/compile/estimate', {
+      auth: { token: org.token },
+      body: { kind: 'truthtable', source: 'a b | out\n0 0 | 0\n0 1 | 0\n1 0 | 0\n1 1 | 1\n' },
+    });
+    expect(python.status, JSON.stringify(python.body)).toBe(200);
+    expect(table.status).toBe(200);
+    expect(python.body.resources.measured.qubits).toBe(table.body.resources.measured.qubits);
+    expect(python.body.resources.measured.gateCount).toBe(table.body.resources.measured.gateCount);
+  });
+});

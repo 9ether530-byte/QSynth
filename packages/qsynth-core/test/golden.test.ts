@@ -12,7 +12,7 @@
  * rather than serialised blobs. A diff in one of them must be explained in the PR.
  */
 import { describe, expect, it } from 'vitest';
-import { assignmentToBits, compile, outputsByName, run, initialState, type Bit } from '@qsynth/core';
+import { assignmentToBits, compile, outputsByName, run, initialState, SPEC_KINDS, type Bit } from '@qsynth/core';
 import { CORPUS } from './corpus.js';
 
 describe.each(CORPUS)('$name', (entry) => {
@@ -95,8 +95,10 @@ describe.each(CORPUS)('$name', (entry) => {
 });
 
 describe('the corpus as a whole', () => {
-  it('covers both frontends', () => {
-    expect(new Set(CORPUS.map((c) => c.kind))).toEqual(new Set(['boolean', 'truthtable']));
+  it('covers every frontend', () => {
+    // Every notation the API accepts has to have at least one circuit here, or a frontend
+    // can regress without a single golden file moving.
+    expect(new Set(CORPUS.map((c) => c.kind))).toEqual(new Set(SPEC_KINDS));
   });
 
   it('exercises every reversible gate kind the emitter can produce', () => {

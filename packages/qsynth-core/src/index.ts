@@ -17,6 +17,9 @@ export * from './frontend/boolean/parser.js';
 export * from './frontend/boolean/lower.js';
 export * from './frontend/truthtable/parser.js';
 export * from './frontend/truthtable/lower.js';
+export * from './frontend/python/lexer.js';
+export * from './frontend/python/parser.js';
+export * from './frontend/python/lower.js';
 
 // Re-exported by name rather than with `*`: the quantum IR has its own `depth`,
 // `gateCount` and `gatesByKind`, and a star export would silently drop whichever lost

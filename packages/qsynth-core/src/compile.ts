@@ -25,6 +25,7 @@ import type { ReversibleCircuit } from './ir/reversible.js';
 import type { QuantumCircuit } from './ir/quantum.js';
 import { lowerBoolean } from './frontend/boolean/lower.js';
 import { lowerTruthTable } from './frontend/truthtable/lower.js';
+import { lowerPython } from './frontend/python/lower.js';
 import { lowerToReversible } from './lowering/classicalToReversible.js';
 import { lowerToQuantum } from './lowering/reversibleToQuantum.js';
 import { estimate as estimateResources, projectGateCount, projectVerificationOps, type ResourceBudget, type ResourceEstimate } from './estimate/resources.js';
@@ -38,9 +39,9 @@ import { TraceRecorder, type TraceEntry } from './trace/trace.js';
 import { seedFromHash } from './util/rng.js';
 import { COMPILER_VERSION } from './version.js';
 
-export type SpecKind = 'boolean' | 'truthtable';
+export type SpecKind = 'boolean' | 'truthtable' | 'python';
 
-export const SPEC_KINDS: readonly SpecKind[] = ['boolean', 'truthtable'];
+export const SPEC_KINDS: readonly SpecKind[] = ['boolean', 'truthtable', 'python'];
 
 /**
  * The ceiling on projected simulation work. 50M basis-state gate applications is roughly
@@ -136,6 +137,11 @@ export function parseSpec(request: CompileRequest, trace: TraceRecorder): Classi
       return lowerBoolean(request.source, { moduleName: name, trace });
     case 'truthtable':
       return lowerTruthTable(request.source, { moduleName: name, trace });
+    case 'python':
+      // The module takes its name from the `def` unless the caller named the spec, so a
+      // file that reads `def full_adder(...)` produces a circuit called `full_adder`
+      // rather than `module`.
+      return lowerPython(request.source, { moduleName: request.name, trace });
     default:
       throw invalidSpec(
         `Unknown specification kind "${request.kind}".`,

@@ -66,8 +66,14 @@ export const unsupported = (construct: string, supported: readonly string[], spa
     { span, details: { construct, supported } },
   );
 
-export const invalidSpec = (message: string, hint: string, details: Record<string, unknown> = {}) =>
-  new QsynthError('INVALID_SPEC', message, hint, { details });
+/**
+ * A specification that parsed but cannot be built. The span is optional because some of
+ * these are properties of the whole module (too many inputs, no outputs) rather than of
+ * one line — but where there *is* a line, passing it is what puts the marker in the
+ * editor next to the code that caused it.
+ */
+export const invalidSpec = (message: string, hint: string, details: Record<string, unknown> = {}, span?: Span) =>
+  new QsynthError('INVALID_SPEC', message, hint, { details, span });
 
 /** Internal invariant violation: a bug in the compiler, not in the user's input. */
 export function assertInvariant(condition: unknown, what: string): asserts condition {

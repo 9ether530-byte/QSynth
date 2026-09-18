@@ -137,6 +137,68 @@ export const CORPUS: readonly CorpusEntry[] = [
     inputs: ['x0', 'x1', 'x2'],
     reference: ([x0, x1, x2]) => ({ mark: bit(x0! === 1 && x1! === 0 && x2! === 1) }),
   },
+  {
+    name: 'python_adder_2bit',
+    kind: 'python',
+    purpose: 'Two-bit addition written as Python arithmetic rather than as gates.',
+    source: ['def python_adder_2bit(x: uint2, y: uint2) -> uint3:', '    return x + y'].join('\n'),
+    inputs: ['x[0]', 'x[1]', 'y[0]', 'y[1]'],
+    reference: ([x0, x1, y0, y1]) => {
+      const total = x0! + 2 * x1! + (y0! + 2 * y1!);
+      return { 'out[0]': bit(total & 1), 'out[1]': bit((total >> 1) & 1), 'out[2]': bit((total >> 2) & 1) };
+    },
+  },
+  {
+    name: 'python_comparator_2bit',
+    kind: 'python',
+    purpose: 'Two-bit comparison returning less / equal / greater as a tuple.',
+    source: [
+      'def python_comparator_2bit(x: uint2, y: uint2) -> (bit, bit, bit):',
+      '    return x < y, x == y, x > y',
+    ].join('\n'),
+    inputs: ['x[0]', 'x[1]', 'y[0]', 'y[1]'],
+    reference: ([x0, x1, y0, y1]) => {
+      const x = x0! + 2 * x1!;
+      const y = y0! + 2 * y1!;
+      return { out0: bit(x < y), out1: bit(x === y), out2: bit(x > y) };
+    },
+  },
+  {
+    name: 'python_saturating_add',
+    kind: 'python',
+    purpose: 'Two-bit addition that clamps at 3 rather than wrapping — a branch, lowered to muxes.',
+    source: [
+      'def python_saturating_add(x: uint2, y: uint2) -> uint2:',
+      '    s = x + y',
+      '    if s > 3:',
+      '        r = 3',
+      '    else:',
+      '        r = s',
+      '    return r',
+    ].join('\n'),
+    inputs: ['x[0]', 'x[1]', 'y[0]', 'y[1]'],
+    reference: ([x0, x1, y0, y1]) => {
+      const total = Math.min(3, x0! + 2 * x1! + (y0! + 2 * y1!));
+      return { 'r[0]': bit(total & 1), 'r[1]': bit((total >> 1) & 1) };
+    },
+  },
+  {
+    name: 'python_popcount4',
+    kind: 'python',
+    purpose: 'Hamming weight of four bits, accumulated by an unrolled loop over bit indices.',
+    source: [
+      'def python_popcount4(x: uint4) -> uint3:',
+      '    total = 0',
+      '    for i in range(4):',
+      '        total = total + x[i]',
+      '    return total',
+    ].join('\n'),
+    inputs: ['x[0]', 'x[1]', 'x[2]', 'x[3]'],
+    reference: (bits) => {
+      const total = bits.reduce<number>((acc, b) => acc + b, 0);
+      return { 'total[0]': bit(total & 1), 'total[1]': bit((total >> 1) & 1), 'total[2]': bit((total >> 2) & 1) };
+    },
+  },
 ];
 
 export function entry(name: string): CorpusEntry {
