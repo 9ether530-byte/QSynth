@@ -429,13 +429,14 @@
     "projectId": "…",
     "kind": "boolean",
     "source": "out = (a AND b) XOR c",
-    "budget": { "qubits": 8 }
+    "budget": { "maxQubits": 8 }
   }'</code></pre>
             </div>
             <div>
               <h3 style="margin-bottom: 8px">What comes back</h3>
               <pre><code>{
-  "job": { "status": "succeeded", "seed": 1, … },
+  "job": { "status": "succeeded",
+           "seed": 3248988783, … },
   "verification": {
     "passed": true,
     "stoppedAt": null,
@@ -450,7 +451,8 @@
   },
   "resources": { "measured": { "qubits": 6, … },
                  "cliffordT": { "tCount": 14, … } },
-  "artifacts": [ { "kind": "qasm", "id": "…" }, … ]
+  "artifacts": [ { "kind": "qasm3", "id": "…" },
+                 { "kind": "reversible_ir", … }, … ]
 }</code></pre>
             </div>
           </div>
