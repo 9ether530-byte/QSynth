@@ -7,86 +7,36 @@
  *
  * An unexpected throw is converted to INTERNAL at the edge and logged with its
  * stack; it never leaks an internal message to the caller.
+ *
+ * The codes themselves, their statuses, and whether each is worth retrying live in
+ * `errorcatalog.ts`, which is also what `GET /v1/errors` and `docs/api/errors.md`
+ * are built from. There is deliberately no second list here to fall out of step.
  */
+import { ERROR_CATALOG, type ErrorCode } from './errorcatalog.js';
 
-export type ErrorCode =
-  // auth / authz
-  | 'UNAUTHENTICATED'
-  | 'INVALID_CREDENTIALS'
-  | 'SESSION_EXPIRED'
-  | 'FORBIDDEN'
-  | 'NO_ORG_CONTEXT'
-  | 'NOT_A_MEMBER'
-  // request shape
-  | 'INVALID_REQUEST'
-  | 'NOT_FOUND'
-  | 'CONFLICT'
-  | 'UNSUPPORTED_MEDIA_TYPE'
-  // policy
-  | 'RATE_LIMITED'
-  | 'IDEMPOTENCY_KEY_REUSED'
-  | 'IDEMPOTENT_REQUEST_IN_PROGRESS'
-  | 'VERIFICATION_REQUIRED'
-  | 'SPEC_TOO_LARGE'
-  // compilation (surfaced from @qsynth/core)
-  //
-  // These mirror QsynthErrorCode one-for-one rather than collapsing into a single
-  // COMPILE_FAILED, so a client can tell "your syntax is wrong" from "your design does
-  // not fit the budget you declared" from "the circuit does not implement your spec"
-  // without parsing prose. `fromCompiler` in routes/compile.ts relies on the names
-  // matching exactly.
-  | 'COMPILE_FAILED'
-  | 'PARSE_ERROR'
-  | 'UNSUPPORTED_CONSTRUCT'
-  | 'INVALID_SPEC'
-  | 'BUDGET_EXCEEDED'
-  | 'VERIFICATION_FAILED'
-  // catch-all
-  | 'INTERNAL';
-
-const STATUS: Record<ErrorCode, number> = {
-  UNAUTHENTICATED: 401,
-  INVALID_CREDENTIALS: 401,
-  SESSION_EXPIRED: 401,
-  FORBIDDEN: 403,
-  NO_ORG_CONTEXT: 400,
-  NOT_A_MEMBER: 403,
-  INVALID_REQUEST: 400,
-  NOT_FOUND: 404,
-  CONFLICT: 409,
-  UNSUPPORTED_MEDIA_TYPE: 415,
-  RATE_LIMITED: 429,
-  IDEMPOTENCY_KEY_REUSED: 422,
-  IDEMPOTENT_REQUEST_IN_PROGRESS: 409,
-  VERIFICATION_REQUIRED: 403,
-  SPEC_TOO_LARGE: 413,
-  COMPILE_FAILED: 422,
-  PARSE_ERROR: 422,
-  UNSUPPORTED_CONSTRUCT: 422,
-  INVALID_SPEC: 422,
-  BUDGET_EXCEEDED: 422,
-  VERIFICATION_FAILED: 422,
-  INTERNAL: 500,
-};
+export type { ErrorCode };
 
 export class ApiError extends Error {
   readonly code: ErrorCode;
   readonly status: number;
   readonly hint: string;
   readonly details: Record<string, unknown>;
+  /** Whether replaying this exact request could plausibly succeed. See the catalog. */
+  readonly retryable: boolean;
 
   constructor(code: ErrorCode, message: string, hint: string, details: Record<string, unknown> = {}) {
     super(message);
     this.name = 'ApiError';
     this.code = code;
-    this.status = STATUS[code];
+    this.status = ERROR_CATALOG[code].status;
+    this.retryable = ERROR_CATALOG[code].retryable;
     this.hint = hint;
     this.details = details;
   }
 
   toBody() {
     return {
-      error: { code: this.code, message: this.message, hint: this.hint, ...(Object.keys(this.details).length ? { details: this.details } : {}) },
+      error: { code: this.code, message: this.message, hint: this.hint, retryable: this.retryable, ...(Object.keys(this.details).length ? { details: this.details } : {}) },
     };
   }
 }

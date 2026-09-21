@@ -23,7 +23,28 @@ export const LIMITS = {
   compile: (principal: string): Limit => ({ subject: `compile:${principal}`, perMinute: 20 }),
 } as const;
 
-export async function enforceRateLimit(tx: Tx, orgId: string, limit: Limit): Promise<void> {
+/**
+ * What the caller is told on every response, not only on the one that is refused.
+ *
+ * A limit a client can only discover by hitting it is a limit clients hit. These are
+ * the IETF draft `RateLimit-*` fields; `reset` is seconds remaining in the window
+ * rather than a timestamp, so it needs no clock agreement between us and the caller.
+ */
+export interface RateLimitState {
+  readonly limit: number;
+  readonly remaining: number;
+  readonly reset: number;
+}
+
+export function rateLimitHeaders(state: RateLimitState): Record<string, string> {
+  return {
+    'ratelimit-limit': String(state.limit),
+    'ratelimit-remaining': String(state.remaining),
+    'ratelimit-reset': String(state.reset),
+  };
+}
+
+export async function enforceRateLimit(tx: Tx, orgId: string, limit: Limit): Promise<RateLimitState> {
   const row = await tx.one<{ count: number; window_start: Date }>(
     `insert into rate_limit_buckets (org_id, subject, window_start, count)
      values ($1, $2, to_timestamp(floor(extract(epoch from now()) / $3) * $3), 1)
@@ -33,16 +54,24 @@ export async function enforceRateLimit(tx: Tx, orgId: string, limit: Limit): Pro
     [orgId, limit.subject, WINDOW_SECONDS],
   );
 
-  if (row && row.count > limit.perMinute) {
-    const resetAt = new Date(row.window_start.getTime() + WINDOW_SECONDS * 1000);
-    const retryAfter = Math.max(1, Math.ceil((resetAt.getTime() - Date.now()) / 1000));
+  // A failed insert (the row is null only if the statement returned nothing) must not
+  // be read as "zero used": reporting the full allowance would be a lie in the one
+  // direction that hurts, so the conservative reading is used instead.
+  const used = row?.count ?? limit.perMinute;
+  const windowStart = row?.window_start ?? new Date();
+  const resetAt = new Date(windowStart.getTime() + WINDOW_SECONDS * 1000);
+  const reset = Math.max(1, Math.ceil((resetAt.getTime() - Date.now()) / 1000));
+
+  if (used > limit.perMinute) {
     throw new ApiError(
       'RATE_LIMITED',
       `Rate limit of ${limit.perMinute} requests per minute exceeded.`,
-      `Wait ${retryAfter}s before retrying, or spread requests more evenly.`,
-      { retryAfter, limit: limit.perMinute },
+      `Wait ${reset}s before retrying, or spread requests more evenly.`,
+      { retryAfter: reset, limit: limit.perMinute, remaining: 0, reset },
     );
   }
+
+  return { limit: limit.perMinute, remaining: Math.max(0, limit.perMinute - used), reset };
 }
 
 /** Old windows are never read again; pruned opportunistically to bound table growth. */

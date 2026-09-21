@@ -7,6 +7,7 @@
  * make the API work in development and 404 in production, or the reverse.
  */
 import { ApiError } from './errors.js';
+import { errorTable } from './errorcatalog.js';
 import { dispatch, type HttpResult, type RequestInfo, type Route } from './router.js';
 import { authRoutes } from './routes/auth.js';
 import { projectRoutes } from './routes/projects.js';
@@ -29,6 +30,15 @@ const ROUTES: readonly Route[] = [
     path: '/v1/health',
     auth: 'public',
     handler: async () => ({ status: 200, body: { ok: true, service: 'qsynth-api', version: VERSION } }),
+  },
+  {
+    // Public on purpose: the error contract is not a secret, and a client library that
+    // can fetch the table can generate its own enum and retry policy from the same
+    // source this server answers from, rather than from a copy that ages.
+    method: 'GET',
+    path: '/v1/errors',
+    auth: 'public',
+    handler: async () => ({ status: 200, body: { errors: errorTable() } }),
   },
 ];
 
@@ -155,6 +165,13 @@ export async function handler(event: LambdaEvent): Promise<LambdaResponse> {
       const extra: Record<string, string> = {};
       const retryAfter = err.details['retryAfter'];
       if (typeof retryAfter === 'number') extra['retry-after'] = String(retryAfter);
+      // The refusal itself is thrown before the response headers are assembled, so the
+      // budget it reports travels in the error's details and is turned back into the
+      // same headers a successful response would have carried.
+      for (const field of ['limit', 'remaining', 'reset'] as const) {
+        const value = err.details[field];
+        if (typeof value === 'number') extra[`ratelimit-${field}`] = String(value);
+      }
       return respond({ status: err.status, body: err.toBody(), headers: extra });
     }
 

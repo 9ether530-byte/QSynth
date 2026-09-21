@@ -9,7 +9,7 @@ export default defineConfig({
   },
   test: {
     // Integration tests need a live DATABASE_URL and run under their own config.
-    include: ['packages/**/test/**/*.test.ts'],
+    include: ['packages/**/test/**/*.test.ts', 'functions/*/test/**/*.test.ts'],
     environment: 'node',
     // Property-based and exhaustive-equivalence tests are CPU-bound, not IO-bound.
     testTimeout: 30_000,

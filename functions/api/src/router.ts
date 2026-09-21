@@ -9,7 +9,7 @@ import { authenticate, type Principal } from './auth.js';
 import { assertPermission, type Permission } from './authz.js';
 import { ApiError, invalid, notFound } from './errors.js';
 import { withTx, type Tx } from './db.js';
-import { enforceRateLimit, LIMITS } from './ratelimit.js';
+import { enforceRateLimit, rateLimitHeaders, LIMITS } from './ratelimit.js';
 import { beginIdempotent, releaseIdempotent } from './idempotency.js';
 
 export interface RequestInfo {
@@ -81,6 +81,30 @@ function matchPath(pattern: string, path: string): Record<string, string> | null
   return params;
 }
 
+/**
+ * An Idempotency-Key is a promise the client makes: "this string identifies this
+ * request, and nothing else, forever." The minimum length enforces the only part of
+ * that promise we can check. A one-character key is not a shortened uuid, it is a
+ * client that has not thought about collisions — and the collision it causes is
+ * another caller's response being replayed to it, which is worse than a duplicate.
+ */
+const KEY_MIN = 8;
+const KEY_MAX = 255;
+
+function idempotencyKeyOf(headers: Record<string, string | undefined>): string | undefined {
+  const raw = headers['idempotency-key'] ?? headers['Idempotency-Key'];
+  if (raw === undefined) return undefined;
+  const key = raw.trim();
+  if (key.length < KEY_MIN || key.length > KEY_MAX || /[\x00-\x1f\x7f]/.test(key)) {
+    throw invalid(
+      `Idempotency-Key must be ${KEY_MIN}–${KEY_MAX} printable characters.`,
+      'Use a UUID, or omit the header entirely to send a non-idempotent request.',
+      { header: 'Idempotency-Key' },
+    );
+  }
+  return key;
+}
+
 export async function dispatch(routes: readonly Route[], req: RequestInfo): Promise<HttpResult> {
   let pathMatched = false;
 
@@ -105,23 +129,34 @@ export async function dispatch(routes: readonly Route[], req: RequestInfo): Prom
     }
 
     const principalId = principal.kind === 'session' ? principal.userId : principal.keyId;
-    await withTx({ orgId: principal.orgId, userId: principal.kind === 'session' ? principal.userId : null }, async (tx) => {
-      await enforceRateLimit(tx, principal.orgId, LIMITS[route.rateLimit ?? 'default'](principalId));
+    const rate = await withTx(
+      { orgId: principal.orgId, userId: principal.kind === 'session' ? principal.userId : null },
+      async (tx) => enforceRateLimit(tx, principal.orgId, LIMITS[route.rateLimit ?? 'default'](principalId)),
+    );
+    // Every authenticated response carries the budget, so a client can slow down before
+    // it is refused rather than discovering the limit by tripping it.
+    const withRate = (result: HttpResult): HttpResult => ({
+      ...result,
+      headers: { ...rateLimitHeaders(rate), ...(result.headers ?? {}) },
     });
 
     const ctx: Ctx = { ...req, principal, params };
 
-    const idempotencyKey = route.idempotent ? req.headers['idempotency-key'] ?? req.headers['Idempotency-Key'] : undefined;
-    if (!idempotencyKey) return route.handler(ctx);
+    const idempotencyKey = route.idempotent ? idempotencyKeyOf(req.headers) : undefined;
+    if (!idempotencyKey) return withRate(await route.handler(ctx));
 
     const outcome = await beginIdempotent(principal.orgId, idempotencyKey, req.body);
     if (outcome.kind === 'replay') {
-      return { status: outcome.response.status, body: outcome.response.body, headers: { 'Idempotency-Replayed': 'true' } };
+      return withRate({
+        status: outcome.response.status,
+        body: outcome.response.body,
+        headers: { 'idempotency-replayed': 'true' },
+      });
     }
     try {
       const result = await route.handler(ctx);
       await outcome.commit({ status: result.status, body: result.body });
-      return result;
+      return withRate(result);
     } catch (err) {
       await releaseIdempotent(principal.orgId, idempotencyKey);
       throw err;
