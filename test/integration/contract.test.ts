@@ -71,6 +71,16 @@ describe('the rate-limit budget', () => {
     expect(reset).toBeLessThanOrEqual(60);
   });
 
+  it('is readable by a browser, not only by curl', async () => {
+    const res = await call('GET', '/v1/projects', { auth: { token: tenant.token, orgId: tenant.orgId } });
+    // The workbench is served from a different origin than the API, so a header the
+    // response carries but does not expose might as well not exist there.
+    const exposed = (res.headers.get('access-control-expose-headers') ?? '').toLowerCase();
+    for (const header of ['retry-after', 'ratelimit-limit', 'ratelimit-remaining', 'ratelimit-reset']) {
+      expect(exposed, header).toContain(header);
+    }
+  });
+
   it('counts down as the caller spends it', async () => {
     const first = await call('GET', '/v1/projects', { auth: { token: tenant.token, orgId: tenant.orgId } });
     const second = await call('GET', '/v1/projects', { auth: { token: tenant.token, orgId: tenant.orgId } });
@@ -89,11 +99,13 @@ describe('the rate-limit budget', () => {
     expect(key.status).toBe(201);
 
     const spec = { kind: 'boolean', source: 'out = a AND b' };
-    const attempts = await Promise.all(
-      Array.from({ length: 26 }, () =>
-        call('POST', '/v1/compile/estimate', { auth: { token: key.body.secret }, body: spec }),
-      ),
-    );
+    // Sequential, not concurrent. A parallel burst is throttled by Lambda's own
+    // concurrency cap first, which answers 429 with AWS's body rather than ours — it
+    // would look like a pass while testing nothing about this limiter.
+    const attempts = [];
+    for (let i = 0; i < 26; i++) {
+      attempts.push(await call('POST', '/v1/compile/estimate', { auth: { token: key.body.secret }, body: spec }));
+    }
 
     const refused = attempts.filter((r) => r.status === 429);
     expect(refused.length).toBeGreaterThan(0);

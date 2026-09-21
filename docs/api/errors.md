@@ -26,6 +26,14 @@ is what needs to change.
 The live table is served at `GET /v1/errors`, so a client library can generate its own
 enum and retry policy rather than keeping a copy that ages.
 
+## One exception to the envelope
+
+A `429` whose body is **not** this envelope — no `error.code`, and an
+`x-amzn-errortype` header — came from the platform concurrency throttle in front of
+the API, before any of our code ran. We cannot dress it up as one of ours. Treat it
+exactly like `RATE_LIMITED`: back off and retry. It is the only status a caller can
+receive that is not described below.
+
 ## Authentication
 
 | Code | HTTP | Retryable | Meaning | What to do |

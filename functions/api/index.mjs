@@ -6612,6 +6612,10 @@ var CORS = {
   "access-control-allow-origin": "*",
   "access-control-allow-methods": "GET,POST,PATCH,DELETE,OPTIONS",
   "access-control-allow-headers": "authorization,content-type,x-org-id,idempotency-key",
+  // Without this a browser client cannot read any of these: cross-origin responses
+  // expose only a handful of headers by default, so the rate-limit budget we are at
+  // pains to report would be visible to curl and invisible to the workbench.
+  "access-control-expose-headers": "retry-after,ratelimit-limit,ratelimit-remaining,ratelimit-reset,idempotency-replayed",
   "access-control-max-age": "86400"
 };
 function respond(result) {
