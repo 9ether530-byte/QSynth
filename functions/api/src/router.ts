@@ -4,6 +4,10 @@
  * Deny-by-default is enforced structurally: `auth` is a required field, so a route
  * cannot be added without deciding its authorization. Choosing to make something
  * public requires writing `auth: 'public'` — a visible, reviewable act, not an omission.
+ *
+ * `doc` is required for the same reason. The published endpoint reference is generated
+ * from this table, so an undocumented endpoint is a type error rather than a gap
+ * somebody notices months later from the outside.
  */
 import { authenticate, type Principal } from './auth.js';
 import { assertPermission, type Permission } from './authz.js';
@@ -50,6 +54,8 @@ export type Route =
       method: string;
       path: string;
       auth: 'public';
+      /** One sentence, in the caller's terms. Required — see the note below. */
+      doc: string;
       rateLimit?: keyof typeof LIMITS;
       handler: (ctx: PublicCtx) => Promise<HttpResult>;
     }
@@ -57,6 +63,8 @@ export type Route =
       method: string;
       path: string;
       auth: Exclude<RouteAuth, 'public'>;
+      /** One sentence, in the caller's terms. Required — see the note below. */
+      doc: string;
       rateLimit?: keyof typeof LIMITS;
       /** Honour Idempotency-Key. Set on every POST that costs money or creates state. */
       idempotent?: boolean;

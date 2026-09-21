@@ -258,8 +258,8 @@ async function me(ctx: Ctx) {
 }
 
 export const authRoutes: readonly Route[] = [
-  { method: 'POST', path: '/v1/auth/register', auth: 'public', handler: register },
-  { method: 'POST', path: '/v1/auth/login', auth: 'public', handler: login },
-  { method: 'POST', path: '/v1/auth/logout', auth: 'authenticated', handler: logout },
-  { method: 'GET', path: '/v1/auth/me', auth: 'authenticated', handler: me },
+  { method: 'POST', path: '/v1/auth/register', doc: 'Create an account and its first organization, and return a session token.', auth: 'public', handler: register },
+  { method: 'POST', path: '/v1/auth/login', doc: 'Exchange an email and password for a session token.', auth: 'public', handler: login },
+  { method: 'POST', path: '/v1/auth/logout', doc: 'Revoke the session token used to make this request.', auth: 'authenticated', handler: logout },
+  { method: 'GET', path: '/v1/auth/me', doc: "Describe the calling principal: a user with their organizations and roles, or an API key's scopes.", auth: 'authenticated', handler: me },
 ];

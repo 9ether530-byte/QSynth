@@ -127,9 +127,9 @@ async function destroy(ctx: Ctx) {
 }
 
 export const projectRoutes: readonly Route[] = [
-  { method: 'GET', path: '/v1/projects', auth: 'project:read', handler: list },
-  { method: 'POST', path: '/v1/projects', auth: 'project:write', idempotent: true, handler: create },
-  { method: 'GET', path: '/v1/projects/:id', auth: 'project:read', handler: get },
-  { method: 'PATCH', path: '/v1/projects/:id', auth: 'project:write', handler: update },
-  { method: 'DELETE', path: '/v1/projects/:id', auth: 'project:delete', handler: destroy },
+  { method: 'GET', path: '/v1/projects', doc: 'List the projects in the organization.', auth: 'project:read', handler: list },
+  { method: 'POST', path: '/v1/projects', doc: 'Create a project to hold specifications and their compile history.', auth: 'project:write', idempotent: true, handler: create },
+  { method: 'GET', path: '/v1/projects/:id', doc: 'Fetch one project: its name, description, owner and archived state.', auth: 'project:read', handler: get },
+  { method: 'PATCH', path: '/v1/projects/:id', doc: 'Rename a project, change its description, or archive and unarchive it.', auth: 'project:write', handler: update },
+  { method: 'DELETE', path: '/v1/projects/:id', doc: 'Delete a project and everything compiled under it.', auth: 'project:delete', handler: destroy },
 ];

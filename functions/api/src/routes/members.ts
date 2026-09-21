@@ -235,10 +235,10 @@ async function updateOrganization(ctx: Ctx) {
 }
 
 export const memberRoutes: readonly Route[] = [
-  { method: 'GET', path: '/v1/organization', auth: 'member:read', handler: getOrganization },
-  { method: 'PATCH', path: '/v1/organization', auth: 'org:write', handler: updateOrganization },
-  { method: 'GET', path: '/v1/members', auth: 'member:read', handler: list },
-  { method: 'POST', path: '/v1/members', auth: 'member:write', handler: add },
-  { method: 'PATCH', path: '/v1/members/:userId', auth: 'member:write', handler: changeRole },
-  { method: 'DELETE', path: '/v1/members/:userId', auth: 'member:write', handler: remove },
+  { method: 'GET', path: '/v1/organization', doc: "Fetch the calling organization's name and settings.", auth: 'member:read', handler: getOrganization },
+  { method: 'PATCH', path: '/v1/organization', doc: "Change the organization's name or settings.", auth: 'org:write', handler: updateOrganization },
+  { method: 'GET', path: '/v1/members', doc: "List the organization's members and their roles.", auth: 'member:read', handler: list },
+  { method: 'POST', path: '/v1/members', doc: 'Add an existing user to the organization with a role.', auth: 'member:write', handler: add },
+  { method: 'PATCH', path: '/v1/members/:userId', doc: "Change a member's role.", auth: 'member:write', handler: changeRole },
+  { method: 'DELETE', path: '/v1/members/:userId', doc: 'Remove a member from the organization.', auth: 'member:write', handler: remove },
 ];

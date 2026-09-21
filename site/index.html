@@ -1,96 +1,518 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>OpenKBS Project</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        }
-        .container {
-            background: white;
-            padding: 3rem;
-            border-radius: 16px;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-            text-align: center;
-            max-width: 500px;
-        }
-        h1 { color: #333; margin-bottom: 1rem; }
-        p { color: #666; margin-bottom: 2rem; line-height: 1.6; }
-        .btn {
-            display: inline-block;
-            padding: 12px 24px;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            text-decoration: none;
-            border-radius: 8px;
-            font-weight: 600;
-            transition: transform 0.2s, box-shadow 0.2s;
-        }
-        .btn:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 10px 30px rgba(102, 126, 234, 0.4);
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>OpenKBS Project</h1>
-        <p>Your project is ready. Start building — ask the chat for anything and watch it appear here.</p>
-        <a href="#" class="btn" onclick="testAPI()">Test API</a>
-        <pre id="result" style="margin-top: 2rem; text-align: left; background: #f5f5f5; padding: 1rem; border-radius: 8px; display: none;"></pre>
-    </div>
-    <script>
-        // The preview URL (p-*.…) serves static files only — the API lives on
-        // the production URL. Right after project creation the production
-        // environment needs a minute or two, so instead of surfacing a JSON
-        // parse error we explain and retry.
-        const IS_PREVIEW = /^p-[a-z0-9]+\./.test(location.hostname) || location.port === '6100';
-        let retryTimer = null;
-
-        async function testAPI() {
-            const result = document.getElementById('result');
-            result.style.display = 'block';
-            clearTimeout(retryTimer);
-
-            if (IS_PREVIEW) {
-                result.textContent = '⏳ This is the preview URL — it serves your site\'s static files only.\n' +
-                    'The API runs on your production URL, which is set up automatically\n' +
-                    'right after project creation (usually ready within 1–2 minutes).';
-                return;
-            }
-
-            result.textContent = 'Loading...';
-            try {
-                const response = await fetch('/api', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ action: 'hello', data: { test: true } })
-                });
-                const text = await response.text();
-                let data;
-                try {
-                    data = JSON.parse(text);
-                } catch {
-                    // Got HTML back — the /api route isn't wired yet (production
-                    // environment still being set up). Retry until it is.
-                    result.textContent = '⏳ Setting up production environment… retrying automatically.';
-                    retryTimer = setTimeout(testAPI, 10000);
-                    return;
-                }
-                result.textContent = JSON.stringify(data, null, 2);
-            } catch (e) {
-                result.textContent = '⏳ API not reachable yet (' + e.message + ') — retrying automatically.';
-                retryTimer = setTimeout(testAPI, 10000);
-            }
-        }
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>QSYNTH — classical specifications compiled to verified quantum circuits</title>
+    <meta
+      name="description"
+      content="QSYNTH compiles Boolean expressions, truth tables and a Python subset into reversible and Clifford+T quantum circuits, and refuses to export any circuit it has not proved equivalent to your specification."
+    />
+    <link rel="canonical" href="https://ddxgbnmn43f9o.cloudfront.net/" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="QSYNTH — verified classical-to-quantum compilation" />
+    <meta
+      property="og:description"
+      content="Six checks stand between a specification and an exportable circuit. Equivalence is exhaustive up to 12 inputs, not sampled."
+    />
+    <meta property="og:url" content="https://ddxgbnmn43f9o.cloudfront.net/" />
+    <meta name="twitter:card" content="summary" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "SoftwareApplication",
+        "name": "QSYNTH",
+        "applicationCategory": "DeveloperApplication",
+        "operatingSystem": "Any",
+        "description": "Compiles classical specifications into quantum circuits, and gates export on machine-checked verification."
+      }
     </script>
-</body>
+    <style>
+      /* The palette and the 8 px grid are the workbench's, so the product does not change
+         character between the page that describes it and the tool itself. */
+      :root {
+        --ground: #0b0d10;
+        --panel: #101317;
+        --raised: #161a20;
+        --rule: #232830;
+        --rule-strong: #333a45;
+        --ink: #e8ecf1;
+        --ink-dim: #9aa4b2;
+        --ink-faint: #6b7686;
+        --verified: #22d3ee;
+        --failed: #fb7185;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html {
+        background: var(--ground);
+        color: var(--ink);
+        font-family: 'Space Grotesk', ui-sans-serif, system-ui, sans-serif;
+        font-size: 16px;
+        line-height: 26px;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      body {
+        margin: 0;
+      }
+
+      code,
+      pre {
+        font-family: 'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+        font-size: 13.5px;
+      }
+
+      a {
+        color: var(--verified);
+      }
+
+      /* Never removed, only restyled. */
+      :focus-visible {
+        outline: 2px solid var(--verified);
+        outline-offset: 2px;
+      }
+
+      .skip {
+        position: absolute;
+        left: -9999px;
+      }
+      .skip:focus {
+        left: 8px;
+        top: 8px;
+        z-index: 10;
+        background: var(--panel);
+        border: 1px solid var(--verified);
+        padding: 8px 16px;
+        color: var(--ink);
+      }
+
+      .wrap {
+        max-width: 960px;
+        margin: 0 auto;
+        padding: 0 24px;
+      }
+
+      header.site {
+        border-bottom: 1px solid var(--rule);
+        background: var(--panel);
+      }
+      header.site .wrap {
+        display: flex;
+        align-items: center;
+        gap: 24px;
+        height: 64px;
+      }
+      .mark {
+        font-weight: 600;
+        letter-spacing: 0.2em;
+        font-size: 14px;
+      }
+      header.site nav {
+        margin-left: auto;
+        display: flex;
+        gap: 24px;
+        font-size: 14px;
+      }
+      header.site nav a {
+        color: var(--ink-dim);
+        text-decoration: none;
+      }
+      header.site nav a:hover {
+        color: var(--ink);
+      }
+
+      .btn {
+        display: inline-block;
+        border: 1px solid var(--verified);
+        color: var(--verified);
+        text-decoration: none;
+        padding: 12px 24px;
+        font-size: 14px;
+      }
+      .btn:hover {
+        background: rgba(34, 211, 238, 0.08);
+      }
+      .btn.secondary {
+        border-color: var(--rule-strong);
+        color: var(--ink-dim);
+        margin-left: 8px;
+      }
+      .btn.secondary:hover {
+        color: var(--ink);
+        background: var(--raised);
+      }
+
+      section {
+        padding: 72px 0;
+        border-bottom: 1px solid var(--rule);
+      }
+
+      h1 {
+        font-size: 44px;
+        line-height: 52px;
+        margin: 0 0 24px;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+        max-width: 22ch;
+      }
+      h2 {
+        font-size: 24px;
+        line-height: 32px;
+        margin: 0 0 8px;
+        font-weight: 600;
+      }
+      h3 {
+        font-size: 16px;
+        margin: 0 0 4px;
+        font-weight: 600;
+      }
+      .lede {
+        font-size: 19px;
+        line-height: 30px;
+        color: var(--ink-dim);
+        max-width: 62ch;
+        margin: 0 0 32px;
+      }
+      .note {
+        color: var(--ink-dim);
+        max-width: 68ch;
+        margin: 0 0 32px;
+      }
+      p {
+        max-width: 68ch;
+      }
+
+      .grid {
+        display: grid;
+        gap: 24px;
+        grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      }
+      .card {
+        border: 1px solid var(--rule);
+        background: var(--panel);
+        padding: 24px;
+      }
+      .card p {
+        color: var(--ink-dim);
+        margin: 0;
+        font-size: 15px;
+        line-height: 24px;
+      }
+      .card .num {
+        font-family: 'IBM Plex Mono', monospace;
+        font-size: 12px;
+        color: var(--ink-faint);
+        display: block;
+        margin-bottom: 8px;
+      }
+
+      pre {
+        background: var(--panel);
+        border: 1px solid var(--rule);
+        padding: 16px;
+        overflow-x: auto;
+        line-height: 22px;
+        margin: 0;
+      }
+      .cols {
+        display: grid;
+        gap: 24px;
+        grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+        align-items: start;
+      }
+
+      table {
+        border-collapse: collapse;
+        width: 100%;
+        font-size: 15px;
+      }
+      th,
+      td {
+        text-align: left;
+        border-bottom: 1px solid var(--rule);
+        padding: 12px 16px 12px 0;
+        vertical-align: top;
+      }
+      th {
+        color: var(--ink-faint);
+        font-weight: 500;
+        font-size: 13px;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+      }
+      td.key {
+        white-space: nowrap;
+        font-family: 'IBM Plex Mono', monospace;
+        font-size: 13px;
+      }
+      .ok {
+        color: var(--verified);
+      }
+      .no {
+        color: var(--failed);
+      }
+
+      footer {
+        padding: 40px 0 64px;
+        color: var(--ink-faint);
+        font-size: 14px;
+      }
+      footer a {
+        color: var(--ink-dim);
+      }
+
+      @media (max-width: 640px) {
+        h1 {
+          font-size: 32px;
+          line-height: 40px;
+        }
+        section {
+          padding: 48px 0;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <a class="skip" href="#main">Skip to main content</a>
+
+    <header class="site">
+      <div class="wrap">
+        <span class="mark">QSYNTH</span>
+        <nav aria-label="Primary">
+          <a href="#how">How it works</a>
+          <a href="#verification">Verification</a>
+          <a href="#api">API</a>
+          <a href="/app/">Workbench</a>
+        </nav>
+      </div>
+    </header>
+
+    <main id="main">
+      <section>
+        <div class="wrap">
+          <h1>Classical specifications, compiled to quantum circuits that have been checked.</h1>
+          <p class="lede">
+            Write a Boolean expression, a truth table, or a function in a Python subset. QSYNTH lowers it
+            through a reversible circuit to Clifford+T and emits OpenQASM 3.0 — and will not hand you the
+            result until it has proved the circuit computes what you wrote.
+          </p>
+          <p style="margin: 0 0 32px">
+            <a class="btn" href="/app/">Open the workbench</a>
+            <a class="btn secondary" href="#api">Read the API</a>
+          </p>
+          <p style="color: var(--ink-faint); font-size: 14px">
+            Up to 12 inputs, equivalence is checked on every input assignment — 4096 of 4096, not a sample.
+            Above that the report states the sample count and the seed that produced it, so you can tell the
+            two apart at a glance.
+          </p>
+        </div>
+      </section>
+
+      <section id="how">
+        <div class="wrap">
+          <h2>Four layers, each one inspectable</h2>
+          <p class="note">
+            Nothing between your specification and the emitted circuit is a black box. Every layer is stored
+            and can be read back, including the ancilla ledger that records why each helper qubit was
+            allocated and where it was uncomputed.
+          </p>
+          <div class="grid">
+            <div class="card">
+              <span class="num">01</span>
+              <h3>Classical IR</h3>
+              <p>Your specification as a typed SSA dataflow graph, with source spans preserved.</p>
+            </div>
+            <div class="card">
+              <span class="num">02</span>
+              <h3>Reversible IR</h3>
+              <p>
+                Bennett embedding over NOT, CNOT and Toffoli. Compute, copy out, uncompute — so freedom from
+                garbage is structural rather than a later repair.
+              </p>
+            </div>
+            <div class="card">
+              <span class="num">03</span>
+              <h3>Quantum IR</h3>
+              <p>
+                Clifford+T decomposition by rules each verified once against their exact unitary, with T-count
+                and T-depth reported.
+              </p>
+            </div>
+            <div class="card">
+              <span class="num">04</span>
+              <h3>OpenQASM 3.0</h3>
+              <p>Deterministic output: the same specification compiles to the same bytes, every time.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="verification">
+        <div class="wrap">
+          <h2>Six checks stand between a circuit and an export</h2>
+          <p class="note">
+            The gate is enforced on the server, against the stored report for those exact bytes. It is not a
+            disabled button — an owner with a valid API key gets the same refusal, because the check is on the
+            artifact, not on the caller.
+          </p>
+          <table>
+            <thead>
+              <tr>
+                <th scope="col">Check</th>
+                <th scope="col">What it establishes</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td class="key">type_shape</td>
+                <td>Inputs and outputs have the arity and width your specification declared.</td>
+              </tr>
+              <tr>
+                <td class="key">simulation_equivalence</td>
+                <td>
+                  The circuit agrees with your specification on every input assignment, exhaustively up to 12
+                  inputs; above that, on a stated number of seeded samples.
+                </td>
+              </tr>
+              <tr>
+                <td class="key">reversibility</td>
+                <td>Every gate permutes basis states, so the circuit can be run backwards.</td>
+              </tr>
+              <tr>
+                <td class="key">garbage_free</td>
+                <td>Every ancilla returns to zero on every input. A leaked ancilla is a failed check.</td>
+              </tr>
+              <tr>
+                <td class="key">property</td>
+                <td>Assertions declared alongside the specification hold across the input space.</td>
+              </tr>
+              <tr>
+                <td class="key">resource</td>
+                <td>Qubits, depth, gate count and T-count fit the budget you sent with the request.</td>
+              </tr>
+            </tbody>
+          </table>
+          <p style="margin-top: 24px; color: var(--ink-dim)">
+            A failing check reports a counterexample: the inputs, what your specification says, and what the
+            circuit did. A check that was never reached is reported as not reached — which is a different
+            thing from a check that ran and found nothing to do, and the report says which.
+          </p>
+        </div>
+      </section>
+
+      <section id="api">
+        <div class="wrap">
+          <h2>Everything the workbench does, the API does</h2>
+          <p class="note">
+            The interface is a client of the same REST API you get an API key for. Compile, verify, diff and
+            export are all plain requests.
+          </p>
+          <div class="cols">
+            <div>
+              <h3 style="margin-bottom: 8px">Compile and verify</h3>
+              <pre><code>curl -X POST "$QSYNTH/v1/compile" \
+  -H "Authorization: Bearer $QSYNTH_KEY" \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: $(uuidgen)" \
+  -d '{
+    "projectId": "…",
+    "kind": "boolean",
+    "source": "out = (a AND b) XOR c",
+    "budget": { "qubits": 8 }
+  }'</code></pre>
+            </div>
+            <div>
+              <h3 style="margin-bottom: 8px">What comes back</h3>
+              <pre><code>{
+  "job": { "status": "succeeded", "seed": 1, … },
+  "verification": {
+    "passed": true,
+    "stoppedAt": null,
+    "checksReached": ["type_shape",
+      "simulation_equivalence", … ],
+    "checks": [{
+      "id": "simulation_equivalence",
+      "status": "passed",
+      "coverage": { "mode": "exhaustive",
+                    "checked": 8, "space": 8 }
+    }, … ]
+  },
+  "resources": { "measured": { "qubits": 6, … },
+                 "cliffordT": { "tCount": 14, … } },
+  "artifacts": [ { "kind": "qasm", "id": "…" }, … ]
+}</code></pre>
+            </div>
+          </div>
+          <p style="margin-top: 32px">
+            Errors come back in one envelope: a machine-readable <code>code</code>, a message, a hint, and
+            <code>retryable</code>. The whole table is published at <a href="/api/v1/errors"><code>GET
+            /v1/errors</code></a>, so a client can generate its own enum and retry policy from the API it is
+            actually talking to rather than from a copy that ages. The rate-limit budget is reported on every
+            response, not only on the one that is refused.
+          </p>
+        </div>
+      </section>
+
+      <section id="limits" style="border-bottom: none">
+        <div class="wrap">
+          <h2>What it does not do</h2>
+          <p class="note">Said here, because finding out later is worse.</p>
+          <table>
+            <tbody>
+              <tr>
+                <td class="key no">no</td>
+                <td>
+                  Arbitrary Python. The subset is a whitelist — bounded integers, Boolean and comparison
+                  operators, <code>if</code>/<code>else</code>, and <code>for</code> over literal ranges.
+                  Anything else is refused by name, with the line, and a list of what is supported.
+                </td>
+              </tr>
+              <tr>
+                <td class="key no">no</td>
+                <td>
+                  Hardware execution. QSYNTH emits OpenQASM 3.0 and resource estimates; running that on a
+                  device or a vendor simulator is your next step, not ours.
+                </td>
+              </tr>
+              <tr>
+                <td class="key no">no</td>
+                <td>
+                  Speedup claims. Compiling a classical function to a reversible circuit gives you an oracle,
+                  correctly built and measured. Whether an algorithm around it beats a classical one is a
+                  question about that algorithm.
+                </td>
+              </tr>
+              <tr>
+                <td class="key ok">yes</td>
+                <td>
+                  Exhaustive equivalence up to 12 inputs, a counterexample when it fails, and an export gate
+                  that cannot be talked out of it.
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <div class="wrap">
+        <p style="margin: 0">
+          QSYNTH · <a href="/app/">Workbench</a> · <a href="/api/v1/errors">Error reference</a> ·
+          <a href="/api/v1/health">API status</a>
+        </p>
+      </div>
+    </footer>
+  </body>
 </html>

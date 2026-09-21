@@ -6,6 +6,7 @@
  * `/api` prefix is stripped rather than assumed either way. Getting this wrong would
  * make the API work in development and 404 in production, or the reverse.
  */
+import { COMPILER_VERSION } from '@qsynth/core';
 import { ApiError } from './errors.js';
 import { errorTable } from './errorcatalog.js';
 import { dispatch, type HttpResult, type RequestInfo, type Route } from './router.js';
@@ -18,7 +19,7 @@ import { compileRoutes } from './routes/compile.js';
 
 const VERSION = process.env['QSYNTH_VERSION'] ?? 'dev';
 
-const ROUTES: readonly Route[] = [
+export const ROUTES: readonly Route[] = [
   ...authRoutes,
   ...projectRoutes,
   ...compileRoutes,
@@ -28,8 +29,15 @@ const ROUTES: readonly Route[] = [
   {
     method: 'GET',
     path: '/v1/health',
+    doc: 'Report that the API is reachable, and which compiler version it is running.',
     auth: 'public',
-    handler: async () => ({ status: 200, body: { ok: true, service: 'qsynth-api', version: VERSION } }),
+    // `compilerVersion` is the number that matters to a caller: it is stamped into every
+    // artifact and report, so a client that pins golden output knows from here alone
+    // whether a redeploy could change its bytes. `version` is the deployment label.
+    handler: async () => ({
+      status: 200,
+      body: { ok: true, service: 'qsynth-api', version: VERSION, compilerVersion: COMPILER_VERSION },
+    }),
   },
   {
     // Public on purpose: the error contract is not a secret, and a client library that
@@ -37,6 +45,7 @@ const ROUTES: readonly Route[] = [
     // source this server answers from, rather than from a copy that ages.
     method: 'GET',
     path: '/v1/errors',
+    doc: 'Return the full error-code table this build can answer with.',
     auth: 'public',
     handler: async () => ({ status: 200, body: { errors: errorTable() } }),
   },

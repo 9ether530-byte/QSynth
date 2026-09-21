@@ -156,10 +156,10 @@ async function revoke(ctx: Ctx) {
 }
 
 export const apiKeyRoutes: readonly Route[] = [
-  { method: 'GET', path: '/v1/api-keys', auth: 'apikey:read', handler: list },
+  { method: 'GET', path: '/v1/api-keys', doc: "List the organization's API keys. Secrets are never returned again after creation.", auth: 'apikey:read', handler: list },
   // Deliberately NOT idempotent: replaying a stored response would mean keeping the
   // plaintext key in idempotency_keys, undoing the point of hashing it at rest.
   // A duplicate key is a visible, revocable annoyance; a stored secret is not.
-  { method: 'POST', path: '/v1/api-keys', auth: 'apikey:write', handler: create },
-  { method: 'DELETE', path: '/v1/api-keys/:id', auth: 'apikey:write', handler: revoke },
+  { method: 'POST', path: '/v1/api-keys', doc: 'Issue an API key with a set of scopes. The secret is shown once, in this response.', auth: 'apikey:write', handler: create },
+  { method: 'DELETE', path: '/v1/api-keys/:id', doc: 'Revoke an API key immediately.', auth: 'apikey:write', handler: revoke },
 ];

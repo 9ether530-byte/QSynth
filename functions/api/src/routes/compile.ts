@@ -852,10 +852,10 @@ async function exportArtifact(ctx: Ctx) {
 }
 
 export const compileRoutes: readonly Route[] = [
-  { method: 'POST', path: '/v1/compile', auth: 'compile:run', rateLimit: 'compile', idempotent: true, handler: run },
-  { method: 'POST', path: '/v1/compile/estimate', auth: 'compile:run', rateLimit: 'compile', handler: estimate },
-  { method: 'GET', path: '/v1/compile', auth: 'compile:read', handler: list },
-  { method: 'GET', path: '/v1/compile/:id', auth: 'compile:read', handler: get },
-  { method: 'POST', path: '/v1/compile/:id/verify', auth: 'compile:run', rateLimit: 'compile', handler: reverify },
-  { method: 'GET', path: '/v1/artifacts/:id', auth: 'artifact:read', handler: exportArtifact },
+  { method: 'POST', path: '/v1/compile', doc: 'Compile a specification, verify the result, and return the circuit with its report.', auth: 'compile:run', rateLimit: 'compile', idempotent: true, handler: run },
+  { method: 'POST', path: '/v1/compile/estimate', doc: 'Lower a specification and return its resource cost without verifying it.', auth: 'compile:run', rateLimit: 'compile', handler: estimate },
+  { method: 'GET', path: '/v1/compile', doc: 'List compile jobs in the organization, newest first.', auth: 'compile:read', handler: list },
+  { method: 'GET', path: '/v1/compile/:id', doc: 'Fetch one compile job with its stages, verification report, and resource estimate.', auth: 'compile:read', handler: get },
+  { method: 'POST', path: '/v1/compile/:id/verify', doc: 'Re-run verification against the stored artifacts of an existing job.', auth: 'compile:run', rateLimit: 'compile', handler: reverify },
+  { method: 'GET', path: '/v1/artifacts/:id', doc: "Download an artifact's bytes. Refused unless a passing report vouches for them.", auth: 'artifact:read', handler: exportArtifact },
 ];

@@ -63,5 +63,5 @@ async function list(ctx: Ctx) {
 }
 
 export const auditRoutes: readonly Route[] = [
-  { method: 'GET', path: '/v1/audit-logs', auth: 'audit:read', handler: list },
+  { method: 'GET', path: '/v1/audit-logs', doc: "Read the organization's audit trail, newest first.", auth: 'audit:read', handler: list },
 ];
