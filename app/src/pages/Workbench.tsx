@@ -17,7 +17,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, ApiError } from '../lib/api';
-import { usePermission } from '../lib/session';
+import { usePermission, useSession } from '../lib/session';
 import { useCircuit, useQasm, useTrace } from '../lib/artifacts';
 import type { ArtifactRef, SpecKind, VerificationView, Resources } from '../lib/types';
 import { Panel, Empty, Field, FieldList } from '../components/Panel';
@@ -44,6 +44,7 @@ export default function WorkbenchPage() {
   const { projectId = '' } = useParams();
   const queryClient = useQueryClient();
   const canCompile = usePermission('compile:run');
+  const role = useSession((s) => s.organization?.role);
 
   const [kind, setKind] = useState<SpecKind>('boolean');
   const [source, setSource] = useState(STARTERS.boolean);
@@ -183,6 +184,18 @@ export default function WorkbenchPage() {
         </div>
 
         <div className="ml-auto flex items-center gap-2">
+          {/*
+            Why the button is dead, in text. A `title` on a disabled button reaches
+            nobody who needs it: disabled elements are not focusable, so a keyboard user
+            never triggers the tooltip and a screen reader announces "dimmed button" with
+            no reason. A viewer is then left guessing whether the product is broken.
+          */}
+          {canCompile ? null : (
+            <span className="text-xs text-ink-dim">
+              Your role{role ? <span className="font-mono"> {role}</span> : null} here can read compiles but not
+              start them.
+            </span>
+          )}
           <button type="button" className="qs-btn" onClick={() => estimate.mutate()} disabled={estimate.isPending}>
             {estimate.isPending ? 'Estimating…' : 'Estimate'}
           </button>
@@ -191,7 +204,6 @@ export default function WorkbenchPage() {
             className="qs-btn qs-btn-primary"
             onClick={() => compile.mutate()}
             disabled={compile.isPending || !canCompile}
-            title={canCompile ? undefined : 'Your role cannot start compiles.'}
           >
             {compile.isPending ? 'Compiling…' : 'Compile and verify'}
           </button>

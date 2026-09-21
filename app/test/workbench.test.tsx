@@ -45,6 +45,9 @@ const failedDetail = {
 describe('the workbench', () => {
   beforeEach(() => {
     signIn();
+    // `me` is answered on every route, and its principal is what the store adopts — so a
+    // test that changes the role has to change it here, not only in the store.
+    apiStub.me.mockResolvedValue(fixtures.principal);
     apiStub.job.mockResolvedValue(fixtures.compileDetail);
   });
 
@@ -121,5 +124,24 @@ describe('the workbench', () => {
     // The check's own coverage line. The optimizer's guard reports its coverage in the
     // same words a row below, which is why this is pinned to the paragraph.
     expect(screen.getByText(/exhaustive · 4\/4 assignments/, { selector: 'p' })).toBeTruthy();
+  });
+
+  it('says in words why a viewer cannot compile', async () => {
+    apiStub.me.mockResolvedValue({
+      ...fixtures.principal,
+      activeOrganization: { id: 'o1', role: 'viewer' as const },
+      permissions: ['project:read', 'compile:read', 'artifact:read'],
+    });
+
+    renderAt('/p/p1');
+    await screen.findByRole('heading', { name: 'Oracles' });
+
+    expect(screen.getByRole('button', { name: 'Compile and verify' })).toHaveProperty('disabled', true);
+    // The reason has to be in the document, not in a `title`. A disabled button cannot be
+    // focused, so its tooltip never opens for a keyboard user and a screen reader
+    // announces a dimmed control with no explanation — which reads as a broken product
+    // rather than a permission the user does not have.
+    // And it names the role, so the user knows what to ask for.
+    expect(screen.getByText(/can read compiles but not/).textContent).toContain('viewer');
   });
 });
